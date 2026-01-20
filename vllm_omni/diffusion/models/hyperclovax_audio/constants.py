@@ -1,30 +1,6 @@
 SPEAKERS_LIST = [
-    "fkjy",
     "fkms",
-    "fphj",
-    "mhwj",
-    "mphw",
     "msij",
-    "fbhg",
-    "fcj",
-    "fcsy",
-    "fkjh",
-    "fkms2",
-    "fljh",
-    "fljh2",
-    "mcjm",
-    "mhjw",
-    "mjch",
-    "mjjh",
-    "mkdk",
-    "mkmy",
-    "mkyw",
-    "mlk",
-    "mltm",
-    "mmhb",
-    "mngm",
-    "msnh",
-    "mjhh",
 ]
 
 FORMAT_MIME_MAP = {
@@ -50,4 +26,5 @@ AUDIO_FORMAT_MAP = [
 ]
 
 VOLUME_LEVEL_DB = -26
+
 VOLUME_LEVEL = 10 ** (VOLUME_LEVEL_DB / 20)
