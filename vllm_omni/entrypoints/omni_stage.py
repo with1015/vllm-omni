@@ -236,6 +236,7 @@ def _build_od_config(engine_args: dict[str, Any], model: str) -> dict[str, Any]:
         for key, value in engine_args.items():
             if key in od_field_names:
                 od_config[key] = value
+        od_config["model"] = model  # restore resolved path
     return od_config
 
 
@@ -1211,6 +1212,7 @@ async def _stage_worker_async(
                     engine_args.get("disable_log_stats", True) or getattr(omni_engine_args, "disable_log_stats", True)
                 ),
             )
+            import sys as _s; print("[DBG] Stage-0: from_vllm_config returned", flush=True, file=_s.stderr)
     if hasattr(stage_engine, "log_stats") and stage_engine.log_stats:
 
         async def _force_log():
@@ -1285,7 +1287,9 @@ async def _stage_worker_async(
         }
         # Only add is_tracing_enabled for LLM engines
         if stage_type != "diffusion":
+            import sys as _s2; print("[DBG] Stage-0: calling is_tracing_enabled", flush=True, file=_s2.stderr)
             stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
+            print("[DBG] Stage-0: is_tracing_enabled done", flush=True, file=_s2.stderr)
         out_q.put(stage_ready_payload)
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)

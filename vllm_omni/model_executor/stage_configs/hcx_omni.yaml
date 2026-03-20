@@ -1,106 +1,74 @@
-# Stage config for HyperCLOVAX-SEED-Omni-8B
-# Architecture: thinker (TP=4, GPUs 0-3) → vision decoder (GPU 4) → audio decoder (GPU 5)
-# Text-to-vision: POST /v1/images/generations
-# Image/audio-to-text: POST /v1/chat/completions
-
 stage_args:
-  - stage_id: 0
-    stage_type: llm
-    runtime:
-      process: true
-      devices: "0,1,2,3"
-      max_batch_size: 1
-    engine_args:
-      model_stage: thinker
-      model_arch: HCXVisionV2ForCausalLM
-      worker_type: ar
-      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
-      tensor_parallel_size: 4
-      gpu_memory_utilization: 0.75
-      enforce_eager: true
-      trust_remote_code: true
-      engine_output_type: latent
-      enable_prefix_caching: false
-      max_model_len: 3072
-      max_num_seqs: 1
-      limit_mm_per_prompt:
-        image: 1
-        audio: 1
-    is_comprehension: true
-    final_output: true
-    final_output_type: text
-    default_sampling_params:
-      temperature: 0.1
-      top_p: 1.0
-      top_k: -1
-      max_tokens: 2048
-      seed: 42
-      detokenize: true
-      repetition_penalty: 1.0
-
-  - stage_id: 1
-    stage_type: diffusion
-    runtime:
-      process: true
-      devices: "4"
-      max_batch_size: 1
-    engine_args:
-      model_stage: decoder/vision
-      model_class_name: HyperCLOVAXVisionPipeline
-      gpu_memory_utilization: 0.75
-      enforce_eager: true
-      trust_remote_code: true
-      engine_output_type: image
-    engine_input_source: [0]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2vision_decoder
-    final_output: true
-    final_output_type: image
-    default_sampling_params:
-      height: 768
-      width: 768
-      num_inference_steps: 30
-      guidance_scale: 3.5
-      seed: 42
-
-  - stage_id: 2
-    stage_type: diffusion
-    runtime:
-      process: true
-      devices: "5"
-      max_batch_size: 1
-    engine_args:
-      model_stage: decoder/audio
-      model_class_name: HyperCLOVAXAudioPipeline
-      gpu_memory_utilization: 0.5
-      enforce_eager: true
-      trust_remote_code: true
-      engine_output_type: audio
-    engine_input_source: [0]
-    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2audio_decoder
-    final_output: true
-    final_output_type: audio
-    default_sampling_params:
-      seed: 42
-
+- stage_id: 0
+  stage_type: llm
+  runtime:
+    process: true
+    devices: 0,1,2,3
+    max_batch_size: 1
+  engine_args:
+    model_stage: thinker
+    model_arch: HCXVisionV2ForCausalLM
+    worker_type: ar
+    scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+    tensor_parallel_size: 4
+    gpu_memory_utilization: 0.75
+    enforce_eager: true
+    trust_remote_code: true
+    engine_output_type: latent
+    enable_prefix_caching: false
+    max_model_len: 4096
+    max_num_seqs: 1
+    limit_mm_per_prompt:
+      image: 1
+      audio: 1
+  is_comprehension: true
+  final_output: true
+  final_output_type: text
+  default_sampling_params:
+    temperature: 0.1
+    top_p: 1.0
+    top_k: -1
+    max_tokens: 2048
+    seed: 42
+    detokenize: true
+    repetition_penalty: 1.0
+- stage_id: 1
+  stage_type: diffusion
+  runtime:
+    process: true
+    devices: '4'
+    max_batch_size: 1
+  engine_args:
+    model_class_name: HyperCLOVAXVisionPipeline
+    gpu_memory_utilization: 0.75
+    enforce_eager: true
+    trust_remote_code: true
+    engine_output_type: image
+    distributed_executor_backend: mp
+    model_subdir: decoder/vision
+    model_stage: decoder/vision
+  engine_input_source:
+  - 0
+  custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2vision_decoder
+  final_output: true
+  final_output_type: image
+  default_sampling_params:
+    height: 768
+    width: 768
+    num_inference_steps: 50
+    guidance_scale: 0.75
+    seed: 42
 runtime:
   enabled: true
   defaults:
     window_size: -1
     max_inflight: 1
-
   connectors:
     shared_memory_connector:
       name: SharedMemoryConnector
       extra:
         shm_threshold_bytes: 65536
-
   edges:
-    - from: 0
-      to: 1
-      window_size: -1
-    - from: 0
-      to: 2
-      window_size: -1
-    - from: 1
-      to: 2
-      window_size: -1
+  - from: 0
+    to: 1
+    window_size: -1
