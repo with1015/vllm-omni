@@ -1328,6 +1328,10 @@ async def _stage_worker_async(
             logger.debug("Received batch size=1, request_ids=%s", rid)
             _gen_t0 = _time.time()
             if isinstance(ein, Sequence) and not isinstance(ein, str):
+                if len(ein) == 0:
+                    logger.info("[Stage-%s] Skipping request %s: no engine inputs", stage_id, rid)
+                    out_q.put({"request_id": rid, "stage_id": stage_id, "skipped": True})
+                    return
                 ein = ein[0]
 
             if stage_type == "diffusion":

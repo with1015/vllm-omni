@@ -25,6 +25,7 @@ class OmniDiffusionRequest:
     sampling_params: OmniDiffusionSamplingParams
 
     request_ids: list[str] = field(default_factory=list)
+    extra: dict = field(default_factory=dict)  # Additional data from stage input processors (e.g. vision_tokens, audio_tokens)
 
     def __post_init__(self):
         """Initialize dependent fields after dataclass initialization."""

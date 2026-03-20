@@ -153,10 +153,19 @@ class AsyncOmniDiffusion:
         if lora_request is not None:
             sampling_params.lora_request = lora_request
 
+        # Extract additional_information from OmniTokensPrompt into extra dict
+        # (carries audio_tokens, vision_tokens, etc. from thinker2*_decoder processors)
+        extra: dict = {}
+        if isinstance(prompt, dict) and prompt.get('additional_information'):
+            extra.update(prompt['additional_information'])
+        elif hasattr(prompt, 'additional_information') and prompt.additional_information:
+            extra.update(prompt.additional_information)
+
         request = OmniDiffusionRequest(
             prompts=[prompt],
             sampling_params=sampling_params,
             request_ids=[request_id],
+            extra=extra if extra else {},
         )
 
         logger.debug("Starting generation for request %s", request_id)

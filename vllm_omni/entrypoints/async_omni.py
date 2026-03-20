@@ -513,6 +513,14 @@ class AsyncOmni(OmniBase):
             output_to_yield: An OmniRequestOutput to yield, or None.
         """
         req_id = result.get("request_id")
+
+        if result.get("skipped"):
+            logger.info(f"[{self._name}] Stage {stage_id} skipped request {req_id} (no engine inputs)")
+            class _SkippedOutput:
+                finished = True
+                prompt_token_ids = []
+            return _SkippedOutput(), True, None
+
         if "error" in result:
             logger.error(
                 f"[{self._name}] Stage {stage_id} error on request {req_id}: {result['error']}",
