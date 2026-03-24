@@ -48,7 +48,7 @@ stage_args:
   stage_type: llm
 - custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2vision_decoder
   default_sampling_params:
-    guidance_scale: 9.0
+    guidance_scale: 0.75
     height: 768
     num_inference_steps: 50
     seed: 42
