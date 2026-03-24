@@ -156,6 +156,7 @@ class OmniBase:
     def __init__(self, model: str, **kwargs: Any) -> None:
         model = omni_snapshot_download(model)
         kwargs["model"] = model
+        self._model = model  # store for use in fallback processors init
 
         # Stage management attributes
         self.stage_list: list[OmniStage] = []

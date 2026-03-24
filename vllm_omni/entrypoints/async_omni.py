@@ -238,7 +238,45 @@ class AsyncOmni(OmniBase):
                     logger.warning(
                         f"[{self._name}] Failed to initialize processors from stage-{stage.stage_id}: {e}",
                     )
-        # If no LLM stage found, set processors to None
+        # If no LLM stage found via ZMQ payload, fall back to creating from stage.engine_args
+        if not hasattr(self, "input_processor") or self.input_processor is None:
+            for stage in self.stage_list:
+                if stage.stage_type == "llm" and hasattr(stage, "engine_args") and stage.engine_args is not None:
+                    try:
+                        logger.info(
+                            f"[{self._name}] stage-{stage.stage_id} vllm_config not received via ZMQ, "
+                            "falling back to create_engine_config from stage.engine_args"
+                        )
+                        from vllm.usage.usage_lib import UsageContext
+                        from vllm_omni.engine.arg_utils import AsyncOmniEngineArgs
+                        from vllm_omni.entrypoints.omni_stage import filter_dataclass_kwargs
+                        try:
+                            from omegaconf import OmegaConf
+                            _ea = OmegaConf.to_container(stage.engine_args, resolve=True)
+                        except Exception:
+                            _ea = dict(stage.engine_args)
+                        _ea = filter_dataclass_kwargs(AsyncOmniEngineArgs, _ea)
+                        _ea.pop("model", None)
+                        _model = getattr(self, "_model", None)
+                        if _model is None:
+                            raise RuntimeError("Cannot determine model path for fallback")
+                        _omni_ea = AsyncOmniEngineArgs(model=_model, **_ea)
+                        vllm_config = _omni_ea.create_engine_config(
+                            usage_context=UsageContext.API_SERVER
+                        )
+                        stage.set_vllm_config(vllm_config)
+                        self.input_processor = OmniInputProcessor(vllm_config=vllm_config)
+                        self.model_config = vllm_config.model_config
+                        io_processor_plugin = self.model_config.io_processor_plugin
+                        self.io_processor = get_io_processor(vllm_config, io_processor_plugin)
+                        logger.info(
+                            f"[{self._name}] Initialized input_processor from stage-{stage.stage_id} engine_args fallback"
+                        )
+                        break
+                    except Exception as e:
+                        logger.warning(
+                            f"[{self._name}] Fallback init failed for stage-{stage.stage_id}: {e}"
+                        )
         if not hasattr(self, "input_processor") or self.input_processor is None:
             logger.warning(
                 f"[{self._name}] No LLM stage found, processors will not be available. "

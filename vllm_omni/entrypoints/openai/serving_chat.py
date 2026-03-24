@@ -279,7 +279,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # processor can construct the correct inputs.
         # If we pass pre-tokenized chat-template ids, GLM-Image can become
         # effectively unconditioned and produce nonsense images.
-        if request.modalities and ("image" in request.modalities):
+        if request.modalities and ("image" in request.modalities) and not getattr(request, "continue_final_message", False):
             try:
                 messages_as_dicts: list[dict[str, Any]] = []
                 for msg in request.messages:
@@ -507,7 +507,7 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # For /v1/chat/completions, `request_prompt` is often the rendered chat template.
         # Diffusion models generally want the raw user caption instead.
         output_modalities = getattr(self.engine_client, "output_modalities", None)
-        if output_modalities and ("image" in output_modalities):
+        if output_modalities and ("image" in output_modalities) and not continue_final_message:
             messages_as_dicts: list[dict[str, Any]] = []
             for msg in messages:
                 if hasattr(msg, "model_dump"):
