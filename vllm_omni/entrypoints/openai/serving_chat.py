@@ -1289,22 +1289,54 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
 
                 elif final_output_type == "audio":
                     role = self.get_chat_request_role(request)
-                    choices_data = self._create_audio_choice(omni_res, role, request, stream=True)
-                    chunk = OmniChatCompletionStreamResponse(
-                        id=request_id,
-                        object=chunk_object_type,
-                        created=created_time,
-                        choices=choices_data,
-                        model=model_name,
-                        modality=final_output_type,
-                    )
-                    chunk.usage = UsageInfo(
-                        prompt_tokens=num_prompt_tokens,
-                        completion_tokens=0,
-                        total_tokens=num_prompt_tokens,
-                    )
-                    data = chunk.model_dump_json(exclude_unset=True)
-                    yield f"data: {data}\n\n"
+                    # Stream audio as PCM chunks (200ms each @ 24kHz).
+                    # BigVGAN decoder is non-causal: full audio is generated
+                    # first, then split for streaming delivery to the client.
+                    import numpy as np
+                    _AUDIO_CHUNK_SAMPLES = 4800  # 200ms @ 24kHz
+                    _final_res = omni_res.request_output
+                    _audio_data = _final_res.outputs[0].multimodal_output.get("audio")
+                    if isinstance(_audio_data, list):
+                        _audio_tensor = torch.cat(_audio_data, dim=-1)
+                    else:
+                        _audio_tensor = _audio_data
+                    _audio_tensor = _audio_tensor.float().detach().cpu()
+                    if _audio_tensor.ndim > 1:
+                        _audio_tensor = _audio_tensor.flatten()
+                    _chunks = torch.split(_audio_tensor, _AUDIO_CHUNK_SAMPLES)
+                    for _chunk_idx, _wav_chunk in enumerate(_chunks):
+                        _pcm = (_wav_chunk.numpy() * 32767.0).clip(-32768, 32767).astype(np.int16)
+                        _pcm_b64 = base64.b64encode(_pcm.tobytes()).decode("ascii")
+                        _is_last_chunk = _chunk_idx == len(_chunks) - 1
+                        _stream_choices = []
+                        for output in _final_res.outputs:
+                            _stream_choices.append(
+                                ChatCompletionResponseStreamChoice(
+                                    index=output.index,
+                                    delta=DeltaMessage(
+                                        role=role if _chunk_idx == 0 else None,
+                                        content=_pcm_b64,
+                                    ),
+                                    logprobs=None,
+                                    finish_reason="stop" if _is_last_chunk else None,
+                                    stop_reason=output.stop_reason if _is_last_chunk else None,
+                                )
+                            )
+                        _audio_chunk_resp = OmniChatCompletionStreamResponse(
+                            id=request_id,
+                            object=chunk_object_type,
+                            created=created_time,
+                            choices=_stream_choices,
+                            model=model_name,
+                            modality="audio",
+                        )
+                        if _is_last_chunk:
+                            _audio_chunk_resp.usage = UsageInfo(
+                                prompt_tokens=num_prompt_tokens,
+                                completion_tokens=0,
+                                total_tokens=num_prompt_tokens,
+                            )
+                        yield f"data: {_audio_chunk_resp.model_dump_json(exclude_unset=True)}\n\n"
 
                 else:
                     logger.warning(f"Unsupported streaming final output type: {final_output_type}")

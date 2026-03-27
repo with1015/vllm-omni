@@ -11,6 +11,9 @@ runtime:
   - from: 0
     to: 1
     window_size: -1
+  - from: 0
+    to: 2
+    window_size: -1
   enabled: true
 stage_args:
 - default_sampling_params:
@@ -29,7 +32,7 @@ stage_args:
     limit_mm_per_prompt:
       audio: 1
       image: 1
-    max_model_len: 4096
+    max_model_len: 8192
     max_num_seqs: 8
     model_arch: HCXVisionV2ForCausalLM
     model_stage: thinker
@@ -48,7 +51,7 @@ stage_args:
   stage_type: llm
 - custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2vision_decoder
   default_sampling_params:
-    guidance_scale: 0.75
+    guidance_scale: 0.0
     height: 768
     num_inference_steps: 50
     seed: 42
@@ -71,4 +74,26 @@ stage_args:
     max_batch_size: 1
     process: true
   stage_id: 1
+  stage_type: diffusion
+- custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2audio_decoder
+  default_sampling_params:
+    seed: 42
+  engine_args:
+    distributed_executor_backend: mp
+    enforce_eager: true
+    engine_output_type: audio
+    gpu_memory_utilization: 0.4
+    model_class_name: HyperCLOVAXAudioPipeline
+    model_stage: decoder/audio
+    model_subdir: decoder/audio
+    trust_remote_code: true
+  engine_input_source:
+  - 0
+  final_output: true
+  final_output_type: audio
+  runtime:
+    devices: '5'
+    max_batch_size: 1
+    process: true
+  stage_id: 2
   stage_type: diffusion
