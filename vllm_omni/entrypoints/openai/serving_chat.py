@@ -279,7 +279,12 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # processor can construct the correct inputs.
         # If we pass pre-tokenized chat-template ids, GLM-Image can become
         # effectively unconditioned and produce nonsense images.
-        if request.modalities and ("image" in request.modalities) and not getattr(request, "continue_final_message", False):
+        # Skip if audio input is present (A2T/S2T needs full chat template prompt).
+        _has_audio_input = any(
+            "audio" in (ep.get("multi_modal_data") or {})
+            for ep in engine_prompts
+        )
+        if request.modalities and ("image" in request.modalities) and not getattr(request, "continue_final_message", False) and not _has_audio_input:
             try:
                 messages_as_dicts: list[dict[str, Any]] = []
                 for msg in request.messages:
@@ -506,8 +511,10 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # Preserve a clean text prompt for downstream stages (e.g., GLM-Image diffusion).
         # For /v1/chat/completions, `request_prompt` is often the rendered chat template.
         # Diffusion models generally want the raw user caption instead.
+        # Skip if audio is already in mm_data (A2T request needs full chat template).
         output_modalities = getattr(self.engine_client, "output_modalities", None)
-        if output_modalities and ("image" in output_modalities) and not continue_final_message:
+        _has_audio_mm = "audio" in (engine_prompt.get("multi_modal_data") or {})
+        if output_modalities and ("image" in output_modalities) and not continue_final_message and not _has_audio_mm:
             messages_as_dicts: list[dict[str, Any]] = []
             for msg in messages:
                 if hasattr(msg, "model_dump"):
@@ -1295,31 +1302,46 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                     import numpy as np
                     _AUDIO_CHUNK_SAMPLES = 4800  # 200ms @ 24kHz
                     _final_res = omni_res.request_output
-                    _audio_data = _final_res.outputs[0].multimodal_output.get("audio")
-                    if isinstance(_audio_data, list):
-                        _audio_tensor = torch.cat(_audio_data, dim=-1)
+                    if _final_res is not None and _final_res.outputs:
+                        _audio_data = _final_res.outputs[0].multimodal_output.get("audio")
                     else:
-                        _audio_tensor = _audio_data
-                    _audio_tensor = _audio_tensor.float().detach().cpu()
-                    if _audio_tensor.ndim > 1:
-                        _audio_tensor = _audio_tensor.flatten()
-                    _chunks = torch.split(_audio_tensor, _AUDIO_CHUNK_SAMPLES)
+                        _audio_data = omni_res.multimodal_output.get("audio")
+                    # HyperCLOVAXAudioPipeline returns bytes; Qwen3-Omni returns tensors.
+                    if isinstance(_audio_data, bytes):
+                        _audio_pcm_bytes = _audio_data
+                        _chunks = [_audio_data[i:i+_AUDIO_CHUNK_SAMPLES*2]
+                                   for i in range(0, len(_audio_data), _AUDIO_CHUNK_SAMPLES*2)]
+                    else:
+                        if isinstance(_audio_data, list):
+                            _audio_tensor = torch.cat(_audio_data, dim=-1)
+                        else:
+                            _audio_tensor = _audio_data
+                        _audio_tensor = _audio_tensor.float().detach().cpu()
+                        if _audio_tensor.ndim > 1:
+                            _audio_tensor = _audio_tensor.flatten()
+                        _chunks = list(torch.split(_audio_tensor, _AUDIO_CHUNK_SAMPLES))
+                        _audio_pcm_bytes = None
+                    _stream_outputs = (_final_res.outputs if (_final_res is not None and _final_res.outputs)
+                                       else [None])
                     for _chunk_idx, _wav_chunk in enumerate(_chunks):
-                        _pcm = (_wav_chunk.numpy() * 32767.0).clip(-32768, 32767).astype(np.int16)
-                        _pcm_b64 = base64.b64encode(_pcm.tobytes()).decode("ascii")
+                        if _audio_pcm_bytes is not None:
+                            _pcm_b64 = base64.b64encode(_wav_chunk if isinstance(_wav_chunk, bytes) else _wav_chunk).decode("ascii")
+                        else:
+                            _pcm = (_wav_chunk.numpy() * 32767.0).clip(-32768, 32767).astype(np.int16)
+                            _pcm_b64 = base64.b64encode(_pcm.tobytes()).decode("ascii")
                         _is_last_chunk = _chunk_idx == len(_chunks) - 1
                         _stream_choices = []
-                        for output in _final_res.outputs:
+                        for _so_idx, output in enumerate(_stream_outputs):
                             _stream_choices.append(
                                 ChatCompletionResponseStreamChoice(
-                                    index=output.index,
+                                    index=output.index if output is not None else _so_idx,
                                     delta=DeltaMessage(
                                         role=role if _chunk_idx == 0 else None,
                                         content=_pcm_b64,
                                     ),
                                     logprobs=None,
                                     finish_reason="stop" if _is_last_chunk else None,
-                                    stop_reason=output.stop_reason if _is_last_chunk else None,
+                                    stop_reason=(output.stop_reason if (output is not None and _is_last_chunk) else None),
                                 )
                             )
                         _audio_chunk_resp = OmniChatCompletionStreamResponse(
@@ -1763,33 +1785,42 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
     ):
         choices: list[ChatCompletionResponseChoice] = []
         final_res = omni_outputs.request_output
-        # OMNI: Access multimodal_output from CompletionOutput (outputs[0]), not from RequestOutput
-        # Reference: examples/offline_inference/qwen3_omni/end2end.py line 421
-        audio_data = final_res.outputs[0].multimodal_output.get("audio")
-        if isinstance(audio_data, list):
-            if stream:
-                audio_tensor = audio_data[-1]
-            else:
-                audio_tensor = torch.cat(audio_data, dim=-1)
+        # HyperCLOVAXAudioPipeline (diffusion): audio is in omni_outputs.multimodal_output
+        # (final_res.request_output is None, so final_res.outputs == []).
+        # Qwen3-Omni pipeline: audio is in final_res.outputs[0].multimodal_output.
+        if final_res is not None and final_res.outputs:
+            audio_data = final_res.outputs[0].multimodal_output.get("audio")
         else:
-            audio_tensor = audio_data
-        audio_tensor = audio_tensor.float().detach().cpu().numpy()
+            audio_data = omni_outputs.multimodal_output.get("audio")
+        # HyperCLOVAXAudioPipeline post-process returns bytes (WAV/PCM).
+        # Qwen3-Omni returns tensors or list-of-tensors.
+        if isinstance(audio_data, bytes):
+            audio_base64 = base64.b64encode(audio_data).decode("ascii")
+        else:
+            if isinstance(audio_data, list):
+                if stream:
+                    audio_tensor = audio_data[-1]
+                else:
+                    audio_tensor = torch.cat(audio_data, dim=-1)
+            else:
+                audio_tensor = audio_data
+            audio_tensor = audio_tensor.float().detach().cpu().numpy()
 
-        # Ensure audio is 1D (flatten if needed)
-        if audio_tensor.ndim > 1:
-            audio_tensor = audio_tensor.flatten()
+            # Ensure audio is 1D (flatten if needed)
+            if audio_tensor.ndim > 1:
+                audio_tensor = audio_tensor.flatten()
 
-        audio_obj = CreateAudio(
-            audio_tensor=audio_tensor,
-            sample_rate=24000,
-            response_format="wav",
-            speed=1.0,
-            stream_format="audio",
-            base64_encode=True,
-        )
+            audio_obj = CreateAudio(
+                audio_tensor=audio_tensor,
+                sample_rate=24000,
+                response_format="wav",
+                speed=1.0,
+                stream_format="audio",
+                base64_encode=True,
+            )
 
-        audio_response: AudioResponse = self.create_audio(audio_obj)
-        audio_base64 = audio_response.audio_data
+            audio_response: AudioResponse = self.create_audio(audio_obj)
+            audio_base64 = audio_response.audio_data
 
         # Generate unique ID for the audio
         audio_id = f"audio-{uuid.uuid4().hex[:16]}"
@@ -1805,19 +1836,21 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             transcript="",  # Empty transcript if not available
         )
 
-        for output in final_res.outputs:
+        _output_list = (final_res.outputs if (final_res is not None and final_res.outputs)
+                        else [None])
+        for _choice_idx, output in enumerate(_output_list):
             if stream:
                 choice_data = ChatCompletionResponseStreamChoice(
-                    index=output.index,
+                    index=output.index if output is not None else _choice_idx,
                     delta=DeltaMessage(role=role, content=audio_base64),
                     logprobs=None,
                     finish_reason="stop",
-                    stop_reason=output.stop_reason,
-                    token_ids=(as_list(output.token_ids) if request.return_token_ids else None),
+                    stop_reason=output.stop_reason if output is not None else None,
+                    token_ids=(as_list(output.token_ids) if (output is not None and request.return_token_ids) else None),
                 )
             else:
                 choice_data = ChatCompletionResponseChoice(
-                    index=output.index,
+                    index=output.index if output is not None else _choice_idx,
                     message=ChatMessage(role=role, audio=audio_obj),
                     logprobs=None,
                     finish_reason="stop",
