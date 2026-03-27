@@ -7,7 +7,12 @@ from vllm.config.multimodal import MMCacheType, MMEncoderTPMode
 from vllm.config.utils import config
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
-from vllm.v1.attention.backends.registry import AttentionBackendEnum
+try:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
+except ImportError:
+    from enum import Enum
+    class AttentionBackendEnum(Enum):
+        FLASH_ATTN = "flash_attn"
 
 import vllm_omni.model_executor.models as me_models
 

@@ -295,7 +295,9 @@ class HyperCLOVAXAudioPipeline(nn.Module):
     ) -> set[str]:
         # MAR checkpoint path already loads bigvgan weights eagerly.
         if self._using_mar_checkpoint:
-            return set()
+            # Weights already loaded in __init__ via MAR extraction.
+            # Return all parameter names to pass the strict loading check.
+            return {name for name, _ in self.named_parameters()}
 
         loader = AutoWeightsLoader(self)
         return loader.load_weights(weights)

@@ -56,13 +56,26 @@ from vllm.model_executor.models.interfaces import (
     SupportsTranscription,
 )
 from vllm.model_executor.models.module_mapping import MultiModelKeys
-from vllm.model_executor.models.qwen2_5_omni_thinker import (
-    Qwen2_5OmniAudioFeatureInputs,
-    Qwen2_5OmniThinkerDummyInputsBuilder,
-    Qwen2_5OmniThinkerMultiModalProcessor,
-    check_interleaved_audio_video,
-    merge_interleaved_embeddings,
-)
+try:
+    from vllm.model_executor.models.qwen2_5_omni_thinker import (
+        Qwen2_5OmniAudioFeatureInputs,
+        Qwen2_5OmniThinkerDummyInputsBuilder,
+        Qwen2_5OmniThinkerMultiModalProcessor,
+        check_interleaved_audio_video,
+        merge_interleaved_embeddings,
+    )
+except ImportError:
+    from vllm.model_executor.models.qwen2_5_omni_thinker import (  # type: ignore[no-redef]
+        Qwen2_5OmniAudioFeatureInputs,
+        Qwen2_5OmniThinkerDummyInputsBuilder,
+        Qwen2_5OmniThinkerMultiModalProcessor,
+    )
+
+    def check_interleaved_audio_video(*a, **k):
+        return False
+
+    def merge_interleaved_embeddings(*a, **k):
+        raise NotImplementedError("merge_interleaved_embeddings not available")
 from vllm.model_executor.models.qwen2_5_vl import (
     Qwen2_5_VLProcessingInfo,
 )
