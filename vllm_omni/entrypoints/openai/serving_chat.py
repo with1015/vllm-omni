@@ -1306,29 +1306,26 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
                         _audio_data = _final_res.outputs[0].multimodal_output.get("audio")
                     else:
                         _audio_data = omni_res.multimodal_output.get("audio")
-                    # HyperCLOVAXAudioPipeline returns bytes; Qwen3-Omni returns tensors.
+                    # Normalize audio to float32 tensor for uniform PCM chunking.
+                    # HyperCLOVAXAudioPipeline returns WAV bytes (with header); parse to strip it.
+                    # Qwen3-Omni returns float tensors directly.
+                    import soundfile as _sf, io as _io
                     if isinstance(_audio_data, bytes):
-                        _audio_pcm_bytes = _audio_data
-                        _chunks = [_audio_data[i:i+_AUDIO_CHUNK_SAMPLES*2]
-                                   for i in range(0, len(_audio_data), _AUDIO_CHUNK_SAMPLES*2)]
+                        _arr, _ = _sf.read(_io.BytesIO(_audio_data))
+                        if _arr.ndim > 1:
+                            _arr = _arr.mean(axis=1)
+                        _audio_tensor = torch.from_numpy(_arr.astype(np.float32))
+                    elif isinstance(_audio_data, list):
+                        _audio_tensor = torch.cat(_audio_data, dim=-1).float().detach().cpu()
                     else:
-                        if isinstance(_audio_data, list):
-                            _audio_tensor = torch.cat(_audio_data, dim=-1)
-                        else:
-                            _audio_tensor = _audio_data
-                        _audio_tensor = _audio_tensor.float().detach().cpu()
-                        if _audio_tensor.ndim > 1:
-                            _audio_tensor = _audio_tensor.flatten()
-                        _chunks = list(torch.split(_audio_tensor, _AUDIO_CHUNK_SAMPLES))
-                        _audio_pcm_bytes = None
+                        _audio_tensor = _audio_data.float().detach().cpu()
+                    _audio_tensor = _audio_tensor.flatten()
+                    _chunks = list(torch.split(_audio_tensor, _AUDIO_CHUNK_SAMPLES))
                     _stream_outputs = (_final_res.outputs if (_final_res is not None and _final_res.outputs)
                                        else [None])
                     for _chunk_idx, _wav_chunk in enumerate(_chunks):
-                        if _audio_pcm_bytes is not None:
-                            _pcm_b64 = base64.b64encode(_wav_chunk if isinstance(_wav_chunk, bytes) else _wav_chunk).decode("ascii")
-                        else:
-                            _pcm = (_wav_chunk.numpy() * 32767.0).clip(-32768, 32767).astype(np.int16)
-                            _pcm_b64 = base64.b64encode(_pcm.tobytes()).decode("ascii")
+                        _pcm = (_wav_chunk.numpy() * 32767.0).clip(-32768, 32767).astype(np.int16)
+                        _pcm_b64 = base64.b64encode(_pcm.tobytes()).decode("ascii")
                         _is_last_chunk = _chunk_idx == len(_chunks) - 1
                         _stream_choices = []
                         for _so_idx, output in enumerate(_stream_outputs):
