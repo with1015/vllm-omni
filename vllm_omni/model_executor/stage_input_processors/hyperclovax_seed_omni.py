@@ -129,7 +129,15 @@ def thinker2audio_decoder(
             continue
 
         # Pipeline expects audio_tokens as list[list[int]] (batch),
-        # speakers as list[str], and formats as list[str].
+        # speakers as list[str], formats as list[str], and optional
+        # ref_audio_tokens for zero-shot TTS (ECAPA-TDNN speaker embedding).
+        # ref_audio_b64 is the raw base64 audio from the user's input message,
+        # injected by serving_chat.py into the engine_prompt dict.
+        _ref = None
+        if isinstance(prompt, list) and prompt:
+            _p = prompt[0]
+            if isinstance(_p, dict):
+                _ref = _p.get("ref_audio_b64")
         audio_decoder_inputs.append(
             OmniTokensPrompt(
                 prompt_token_ids=audio_codes,
@@ -137,6 +145,7 @@ def thinker2audio_decoder(
                     "request_id": thinker_output.request_id,
                     "audio_tokens": [audio_codes],
                     "speakers": ["fkms"],
+                    "ref_audio_tokens": [_ref],
                 },
                 multi_modal_data=None,
                 mm_processor_kwargs=None,

@@ -263,6 +263,24 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
             logger.exception("Error in preprocessing prompt inputs")
             return self.create_error_response(f"{e} {e.__cause__}")
 
+        # Zero-shot TTS: extract last input_audio bytes as speaker reference for S2S.
+        _ref_audio_b64 = None
+        for _msg in request.messages:
+            _content = getattr(_msg, 'content', None) or (_msg.get('content') if isinstance(_msg, dict) else None)
+            if isinstance(_content, list):
+                for _part in _content:
+                    _ptype = (_part.get('type') if isinstance(_part, dict) else getattr(_part, 'type', None))
+                    if _ptype == 'input_audio':
+                        _ia = (_part.get('input_audio') if isinstance(_part, dict) else getattr(_part, 'input_audio', None))
+                        if _ia is not None:
+                            _data = (_ia.get('data') if isinstance(_ia, dict) else getattr(_ia, 'data', None))
+                            if _data:
+                                _ref_audio_b64 = _data
+        if _ref_audio_b64 is not None:
+            for _ep in engine_prompts:
+                if isinstance(_ep, dict):
+                    _ep['ref_audio_b64'] = _ref_audio_b64
+
         request_id = f"chatcmpl-{self._base_request_id(raw_request, request.request_id)}"
 
         request_metadata = RequestResponseMetadata(request_id=request_id)
