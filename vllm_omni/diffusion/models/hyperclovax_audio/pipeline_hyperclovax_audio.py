@@ -172,7 +172,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                         f"Unit indices out of range "
                         f"[0-{self._vocab - 1}]: {bad_idxs}")
 
-            if ref_audio is not None:
+            if ref_audio is not None and not self.bigvgan.finetune:
                 ref_audio_bytes = base64.b64decode(
                     ref_audio.encode("ascii"), validate=True)
                 ref_mel = (

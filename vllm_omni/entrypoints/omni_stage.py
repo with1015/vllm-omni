@@ -611,6 +611,15 @@ class OmniStage:
             request_id, engine_outputs (or engine_outputs_shm), and metrics.
         """
         assert self._out_q is not None
+        # Ensure transformers_modules (trust_remote_code cache) is importable
+        # in this process before pickle deserialization of Stage-0 output.
+        import os as _os, sys as _sys
+        _hf_modules = _os.path.join(
+            _os.environ.get("HF_HOME", _os.path.join(_os.path.expanduser("~"), ".cache", "huggingface")),
+            "modules"
+        )
+        if _hf_modules not in _sys.path:
+            _sys.path.insert(0, _hf_modules)
         try:
             return self._out_q.get_nowait()
         except queue.Empty:
