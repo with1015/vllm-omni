@@ -134,7 +134,9 @@ def thinker2audio_decoder(
         # ref_audio_b64 is the raw base64 audio from the user's input message,
         # injected by serving_chat.py into the engine_prompt dict.
         _ref = None
-        if isinstance(prompt, list) and prompt:
+        if isinstance(prompt, dict):
+            _ref = prompt.get("ref_audio_b64")
+        elif isinstance(prompt, list) and prompt:
             _p = prompt[0]
             if isinstance(_p, dict):
                 _ref = _p.get("ref_audio_b64")

@@ -62,7 +62,7 @@ def get_hyperclovax_audio_post_process_func(od_config: OmniDiffusionConfig):
                 pcm.tobytes(), frame_rate=24000,
                 sample_width=pcm.dtype.itemsize, channels=1)
             buf = io.BytesIO()
-            segment.export(buf, format=fmt)
+            segment.export(buf, format=fmt if fmt is not None else "wav")
             response.append(buf.getvalue())
 
         # BUG FIX #1: Original PR #869 was missing this return statement

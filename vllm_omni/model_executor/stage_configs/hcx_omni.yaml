@@ -88,7 +88,7 @@ stage_args:
     gpu_memory_utilization: 0.4
     model_class_name: HyperCLOVAXAudioPipeline
     model_stage: decoder/audio
-    model: decoder/audio/NCZSCosybigvganDecoder.mar
+    model_subdir: decoder/audio/NCZSCosybigvganDecoder.mar
     trust_remote_code: true
   engine_input_source:
   - 0
