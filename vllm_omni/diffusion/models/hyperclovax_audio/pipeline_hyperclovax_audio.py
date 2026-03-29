@@ -180,6 +180,13 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                         ref_audio_bytes, self.bigvgan.h)
                     .to(self.device).to(self._dtype))
                 batch.append((units, ref_mel, None))
+            elif ref_audio is None and not self.bigvgan.finetune:
+                # Zero-shot decoder (ECAPA-TDNN) with no reference: use zero
+                # mel as fallback so text-only requests don't crash.
+                n_mels = int(getattr(self.bigvgan.h, "num_mels", 100))
+                ref_mel = torch.zeros(1, n_mels, 64,
+                                      device=self.device, dtype=self._dtype)
+                batch.append((units, ref_mel, None))
             else:
                 speaker = "fkms" if speaker is None else speaker
                 fmt = (DEFAULT_FORMAT.lower() if fmt is None
