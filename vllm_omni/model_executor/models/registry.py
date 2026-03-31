@@ -85,6 +85,12 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
+    ## HyperCLOVAX-SEED-Think-32B
+    "HyperCLOVAXOmniForCausalLM": (
+        "hyperclovax_omni",
+        "hyperclovax_omni",
+        "HyperCLOVAXOmniForCausalLM",
+    ),
 }
 
 
