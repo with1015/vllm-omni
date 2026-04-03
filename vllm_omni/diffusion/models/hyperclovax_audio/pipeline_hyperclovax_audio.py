@@ -132,7 +132,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         self.bigvgan = HyperCLOVAXAudioDecoderModel.from_pretrained(
             f"{bigvgan_dir}/unit-bigvgan.pt",
             config_path=f"{bigvgan_dir}/config.json"
-        ).to(self.device)
+        ).to(self.device).eval()
 
         self.spk_emb = self.bigvgan.spk_emb.to(self.device)
         self._vocab = int(getattr(self.bigvgan.h, "num_units", 0))
@@ -163,17 +163,18 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             if ref_audio is not None and not self.bigvgan.finetune:
                 ref_audio_bytes = base64.b64decode(
                     ref_audio.encode("ascii"), validate=True)
+                # Keep float32 to match ECAPA-TDNN model weights dtype.
                 ref_mel = (
                     self._get_reference_mel_spectrogram(
                         ref_audio_bytes, self.bigvgan.h)
-                    .to(self.device).to(self._dtype))
+                    .to(self.device))
                 batch.append((units, ref_mel, None))
             elif ref_audio is None and not self.bigvgan.finetune:
                 # Zero-shot decoder (ECAPA-TDNN) with no reference: use zero
                 # mel as fallback so text-only requests don't crash.
                 n_mels = int(getattr(self.bigvgan.h, "num_mels", 100))
-                ref_mel = torch.zeros(1, n_mels, 64,
-                                      device=self.device, dtype=self._dtype)
+                # float32 to match ECAPA-TDNN model weights dtype.
+                ref_mel = torch.zeros(1, n_mels, 64, device=self.device)
                 batch.append((units, ref_mel, None))
             else:
                 speaker = "fkms" if speaker is None else speaker
