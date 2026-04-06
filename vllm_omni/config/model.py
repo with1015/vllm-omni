@@ -6,18 +6,37 @@ import torch
 import vllm.envs as envs
 from pydantic import ConfigDict
 from pydantic.dataclasses import dataclass
-from vllm.attention.backends.registry import AttentionBackendEnum
+try:
+    from vllm.attention.backends.registry import AttentionBackendEnum
+except ImportError:
+    from vllm.v1.attention.backends.registry import AttentionBackendEnum
 from vllm.config import ModelConfig, config
-from vllm.config.model import (
-    _RUNNER_CONVERTS,
-    _RUNNER_TASKS,
-    ConvertOption,
-    ConvertType,
-    RunnerOption,
-    TaskOption,
-    _get_and_verify_dtype,
-    get_served_model_name,
-)
+try:
+    from vllm.config.model import (
+        _RUNNER_CONVERTS,
+        _RUNNER_TASKS,
+        ConvertOption,
+        ConvertType,
+        RunnerOption,
+        TaskOption,
+        _get_and_verify_dtype,
+        get_served_model_name,
+    )
+except ImportError:
+    # vLLM 0.18.0: _RUNNER_TASKS and TaskOption were removed/renamed
+    _RUNNER_TASKS: dict = {
+        "generate": {"generate", "auto"},
+        "pooling": {"embed", "classify", "reward", "score"},
+    }
+    from vllm.config.model import (  # type: ignore[no-redef]
+        _RUNNER_CONVERTS,
+        ConvertOption,
+        ConvertType,
+        RunnerOption,
+        _get_and_verify_dtype,
+        get_served_model_name,
+    )
+    TaskOption = str  # type: ignore[misc,assignment]
 from vllm.config.multimodal import MMCacheType, MMEncoderTPMode, MultiModalConfig
 from vllm.config.pooler import PoolerConfig
 from vllm.logger import init_logger
