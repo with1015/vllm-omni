@@ -1,3 +1,6 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
 import base64
 import io
 import math
@@ -54,6 +57,7 @@ def get_hyperclovax_audio_post_process_func(od_config: OmniDiffusionConfig):
             export_kwargs = {"format": fmt}
             segment.export(buf, **export_kwargs)
             response.append(buf.getvalue())
+        return response
 
     return post_process_func
 
@@ -163,6 +167,8 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             return DiffusionOutput(output=None, error="length of formats and audio_tokens must be the same")
 
         ref_audio_tokens = req.extra.get("ref_audio_tokens")
+        if ref_audio_tokens is None:
+            ref_audio_tokens = [None] * len(audio_tokens)
         if len(audio_tokens) != len(ref_audio_tokens):
             return DiffusionOutput(output=None, error="length of ref_audio_tokens and audio_tokens must be the same")
 
@@ -238,38 +244,15 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         return loader.load_weights(weights)
 
     def _get_pad_multiple(self) -> int | None:
-        pad_multiple_str = os.getenv("AUDIOLLM_PAD_MULTIPLE", 100)
-        if not pad_multiple_str:
-            return None
-
-        try:
-            pad_multiple = int(pad_multiple_str)
-        except ValueError:
-            logger.warning("AUDIOLLM_PAD_MULTIPLE environment variable is not a valid int. Skipping padding...")
-            return None
-
+        pad_multiple = int(getattr(self.bigvgan.h, "pad_multiple", 0))
         if pad_multiple <= 0:
-            logger.warning("AUDIOLLM_PAD_MULTIPLE environment variable is not a positive int. Skipping padding...")
             return None
-
         return pad_multiple
 
     def _get_pad_token_id(self) -> int | None:
-        pad_token_id_str = os.getenv("AUDIOLLM_PAD_TOKEN_ID", 3894)
-        if not pad_token_id_str:
-            logger.warning("AUDIOLLM_PAD_TOKEN_ID environment variable is not set. Skipping padding...")
-            return None
-
-        try:
-            pad_token_id = int(pad_token_id_str)
-        except ValueError:
-            logger.warning("AUDIOLLM_PAD_TOKEN_ID environment variable is not a valid int. Skipping padding...")
-            return None
-
+        pad_token_id = int(getattr(self.bigvgan.h, "pad_token_id", -1))
         if pad_token_id < 0:
-            logger.warning("AUDIOLLM_PAD_TOKEN_ID environment variable is a negative int. Skipping padding...")
             return None
-
         return pad_token_id
 
     def _get_down_sample_rate(self) -> float | None:
@@ -320,8 +303,8 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         return pcm
 
     def _load_reference_audio(self, audio: bytes, sample_rate: float) -> np.ndarray:
-        audio = io.BytesIO(audio)
         fmt = self._detect_audio_format(audio[:4])
+        audio = io.BytesIO(audio)
 
         if fmt:
             segment = pydub.AudioSegment.from_file(audio, format=fmt)
