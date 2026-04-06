@@ -1,3 +1,10 @@
+# SPDX-License-Identifier: Apache-2.0
+# SPDX-FileCopyrightText: Copyright contributors to the vLLM project
+
+# Speaker IDs supported by the model.
+# NOTE: The pretrained model checkpoint supports num_spk=26 speaker embeddings,
+# but only the two IDs below are exposed for external use. Unknown speaker IDs
+# will raise a KeyError at inference time.
 SPEAKERS_LIST = [
     "fkms",
     "msij",

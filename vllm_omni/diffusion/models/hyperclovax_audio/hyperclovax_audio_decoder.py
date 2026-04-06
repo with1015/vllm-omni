@@ -13,6 +13,7 @@ import torch
 import torch.nn as nn
 from torch.nn.utils import remove_weight_norm
 from torch.nn.utils.parametrizations import weight_norm
+from vllm.logger import init_logger
 
 from vllm_omni.diffusion.data import OmniDiffusionConfig
 from vllm_omni.diffusion.models.hyperclovax_audio.activations import Activation1d, SnakeBeta
@@ -24,6 +25,9 @@ class AttrDict(dict):
     def __init__(self, *args, **kwargs):
         super().__init__(*args, **kwargs)
         self.__dict__ = self
+
+
+logger = init_logger(__name__)
 
 
 def load_hparams_from_json(path) -> AttrDict:
@@ -361,6 +365,8 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         fmin: int = 0,
         fmax: int = 8000,
         num_spk: int = 26,
+        pad_multiple: int = 100,
+        pad_token_id: int = 3894,
     ):
         super().__init__()
 
@@ -391,6 +397,8 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
                 "fmin": fmin,
                 "fmax": fmax,
                 "num_spk": num_spk,
+                "pad_multiple": pad_multiple,
+                "pad_token_id": pad_token_id,
             }
         )
 
@@ -533,7 +541,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
 
     def remove_weight_norm(self):
         try:
-            print("Removing weight norm...")
+            logger.info("Removing weight norm...")
             for layer in self.ups:
                 for l_i in layer:
                     remove_weight_norm(l_i)
@@ -542,7 +550,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
             remove_weight_norm(self.conv_pre)
             remove_weight_norm(self.conv_post)
         except ValueError:
-            print("[INFO] Model already removed weight norm. Skipping!")
+            logger.warning("Model already removed weight norm. Skipping!")
             pass
 
     @classmethod
@@ -556,7 +564,7 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
 
         # Load hyperparameters (h) used by BigVGAN
         if config_path is None:
-            print("Loading config.json from local directory")
+            logger.info("Loading config.json from local directory")
             config_path = Path(ckpt_path).with_name("config.json")
 
         h = load_hparams_from_json(config_path)
@@ -565,14 +573,14 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
         model = cls(h)
 
         # Load pretrained generator weight
-        print("Loading weights from local directory")
+        logger.info("Loading weights from local directory")
         checkpoint_dict = torch.load(ckpt_path, map_location=map_location)
 
         try:
             model.load_state_dict(checkpoint_dict["generator"])
         except RuntimeError:
-            print(
-                "[INFO] the pretrained checkpoint does not contain weight norm. "
+            logger.warning(
+                "The pretrained checkpoint does not contain weight norm. "
                 "Loading the checkpoint after removing weight norm!"
             )
             model.remove_weight_norm()
