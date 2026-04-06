@@ -13,7 +13,7 @@ import torch
 from fastapi import Request
 from PIL import Image
 from pydantic import TypeAdapter
-from vllm.renderers import BaseRenderer
+from vllm.renderers.protocol import BaseRenderer
 
 from vllm_omni.entrypoints.async_omni import AsyncOmni
 from vllm_omni.entrypoints.openai.protocol.chat_completion import OmniChatCompletionResponse
@@ -298,18 +298,11 @@ class OmniOpenAIServingChat(OpenAIServingChat, AudioMixin):
         # If we pass pre-tokenized chat-template ids, GLM-Image can become
         # effectively unconditioned and produce nonsense images.
         # Skip if audio input is present (A2T/S2T needs full chat template prompt).
-        # Skip if Stage-0 is an LLM (e.g. HCX Omni thinker) - it needs the
-        # pre-tokenized chat-template prompt, not a bare text prompt.
         _has_audio_input = any(
             "audio" in (ep.get("multi_modal_data") or {})
             for ep in engine_prompts
         )
-        _stage0_is_llm = (
-            hasattr(self.engine_client, "stage_list")
-            and self.engine_client.stage_list
-            and getattr(self.engine_client.stage_list[0], "stage_type", None) == "llm"
-        )
-        if request.modalities and ("image" in request.modalities) and not getattr(request, "continue_final_message", False) and not _has_audio_input and not _stage0_is_llm:
+        if request.modalities and ("image" in request.modalities) and not getattr(request, "continue_final_message", False) and not _has_audio_input:
             try:
                 messages_as_dicts: list[dict[str, Any]] = []
                 for msg in request.messages:

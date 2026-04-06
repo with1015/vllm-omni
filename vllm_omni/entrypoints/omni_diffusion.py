@@ -93,6 +93,13 @@ class OmniDiffusion:
             od_config.model_class_name = pipeline_class
             od_config.tf_model_config = TransformerConfig()
             od_config.update_multimodal_support()
+        except TypeError as e:
+            if config_dict.get("_class_name") == "HyperCLOVAXAudioPipeline":
+                od_config.model_class_name = "HyperCLOVAXAudioPipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
+            else:
+                raise e
 
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
 

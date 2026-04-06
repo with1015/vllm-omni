@@ -1,0 +1,71 @@
+runtime:
+  connectors:
+    shared_memory_connector:
+      extra:
+        shm_threshold_bytes: 65536
+      name: SharedMemoryConnector
+  defaults:
+    max_inflight: 8
+    window_size: -1
+  edges:
+    - from: 0
+      to: 1
+      window_size: -1
+  enabled: true
+
+stage_args:
+  - stage_id: 0
+    stage_type: llm
+    runtime:
+      process: true
+      devices: "0"
+      max_batch_size: 8
+    engine_args:
+      model_stage: thinker
+      model_arch: HyperCLOVAXOmniForCausalLM
+      worker_type: ar
+      scheduler_cls: vllm_omni.core.sched.omni_ar_scheduler.OmniARScheduler
+      max_model_len: 8192
+      max_num_seqs: 8
+      gpu_memory_utilization: 0.9
+      limit_mm_per_prompt:
+        audio: 1
+        image: 1
+      skip_mm_profiling: true
+      engine_output_type: latent
+      enable_prefix_caching: false
+      trust_remote_code: true
+    is_comprehension: true
+    final_output: true
+    final_output_type: text
+    default_sampling_params:
+      temperature: 0.0
+      top_p: 1.0
+      top_k: -1
+      max_tokens: 2048
+      seed: 42
+      detokenize: true
+      repetition_penalty: 1.0
+
+  - stage_id: 1
+    stage_type: diffusion
+    custom_process_input_func: vllm_omni.model_executor.stage_input_processors.hyperclovax_seed_omni.thinker2audio_decoder
+    engine_input_source:
+      - 0
+    runtime:
+      process: true
+      devices: "1"
+      max_batch_size: 1
+    engine_args:
+      distributed_executor_backend: mp
+      enforce_eager: true
+      engine_output_type: audio
+      gpu_memory_utilization: 0.4
+      model_class_name: HyperCLOVAXAudioPipeline
+      model_stage: decoder/audio
+      model_subdir: decoder/audio
+      trust_remote_code: true
+    final_output: true
+    final_output_type: audio
+    default_sampling_params:
+      seed: 42

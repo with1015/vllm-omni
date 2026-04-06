@@ -1,10 +1,7 @@
 import base64
 import io
-import json
 import math
 import os
-import tempfile
-import zipfile
 from collections.abc import Iterable
 from pathlib import Path
 from typing import Any
@@ -18,13 +15,9 @@ import torch.nn as nn
 from librosa.filters import mel as librosa_mel_fn
 from pydub import AudioSegment
 from vllm.logger import init_logger
-from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.model_loader.diffusers_loader import (
-    DiffusersPipelineLoader,
-)
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .constants import (
@@ -41,6 +34,51 @@ logger = init_logger(__name__)
 # Global caches for mel filter banks and Hann windows.
 mel_basis = {}
 hann_window = {}
+
+
+def resolve_hyperclovax_audio_decoder_root(model: str | None) -> Path | None:
+    """Resolve the ``decoder/audio``-style directory that contains ``bigvgan/`` and ``model_index.json``."""
+    if not model:
+        return None
+    p = Path(model).expanduser()
+    try:
+        if p.is_file():
+            return p.resolve().parent
+        if p.is_dir():
+            p = p.resolve()
+            if (p / "bigvgan").is_dir() or (p / "model_index.json").is_file():
+                return p
+            nested = p / "decoder" / "audio"
+            if nested.is_dir():
+                return nested.resolve()
+            return p
+    except OSError:
+        pass
+    return None
+
+
+def _bigvgan_dir_has_weights(bigvgan_dir: Path) -> bool:
+    if not bigvgan_dir.is_dir():
+        return False
+    for pat in ("*.safetensors", "*.bin", "*.pt", "*.pth"):
+        try:
+            if any(bigvgan_dir.glob(pat)):
+                return True
+        except OSError:
+            return False
+    return False
+
+
+def _strip_optional_bigvgan_prefix(
+    state: dict[str, torch.Tensor],
+) -> dict[str, torch.Tensor]:
+    if not state:
+        return state
+    first = next(iter(state))
+    if first.startswith("bigvgan."):
+        return {k[len("bigvgan.") :]: v for k, v in state.items()}
+    return state
+
 
 
 def get_hyperclovax_audio_post_process_func(od_config: OmniDiffusionConfig):
@@ -74,12 +112,6 @@ def get_hyperclovax_audio_post_process_func(od_config: OmniDiffusionConfig):
 class HyperCLOVAXAudioPipeline(nn.Module):
     support_audio_output: bool = True
 
-    @staticmethod
-    def get_dummy_extra() -> dict:
-        """Return dummy extra dict for warmup dummy run."""
-        # Minimal dummy: one empty token sequence, default speaker
-        return {"audio_tokens": [[0] * 10]}
-
     def __init__(self, *, od_config: OmniDiffusionConfig, prefix: str = ""):
         super().__init__()
         self.od_config = od_config
@@ -87,76 +119,26 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         self._dtype = od_config.dtype
 
         self.model = self.od_config.model
-        self._using_mar_checkpoint = False
-        self._mar_extract_dir: str | None = None
 
-        # Default path: diffusers-style weights in bigvgan/ subfolder.
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model,
-                subfolder="bigvgan",
-                revision=None,
-                prefix="bigvgan.",
-                fall_back_to_pt=True,
-            )
-        ]
+        decoder_root = resolve_hyperclovax_audio_decoder_root(self.model)
+        bigvgan_dir = decoder_root / "bigvgan"
 
-        mar_path = self._resolve_mar_path(self.model)
-        if mar_path is not None:
-            self._using_mar_checkpoint = True
-            self.weights_sources = []
-            ckpt_path, config_path = self._extract_mar_checkpoint(mar_path)
-            self.bigvgan = HyperCLOVAXAudioDecoderModel.from_pretrained(
-                ckpt_path=ckpt_path,
-                config_path=config_path,
-                map_location="cpu",
-            ).to(self.device)
-        else:
-            self.bigvgan = HyperCLOVAXAudioDecoderModel(
-                od_config=od_config).to(self.device)
+        logger.info(
+            "HyperCLOVAX audio: loading bigvgan weights from %s (direct load, no DiffusersPipelineLoader)",
+            bigvgan_dir,
+        )
+
+        self.weights_sources = []
+        self.bigvgan = HyperCLOVAXAudioDecoderModel.from_pretrained(
+            f"{bigvgan_dir}/unit-bigvgan.pt",
+            config_path=f"{bigvgan_dir}/config.json"
+        ).to(self.device).eval()
 
         self.spk_emb = self.bigvgan.spk_emb.to(self.device)
         self._vocab = int(getattr(self.bigvgan.h, "num_units", 0))
 
         speakers = SPEAKERS_LIST
         self.speaker_map = {spk: i for i, spk in enumerate(speakers)}
-
-    def _resolve_mar_path(self, model: str | None) -> Path | None:
-        if model is None:
-            return None
-
-        model_path = Path(model)
-        if model_path.is_file() and model_path.suffix == ".mar":
-            return model_path
-
-        if not model_path.is_dir():
-            return None
-
-        candidates = [
-            model_path / "NCCosybigvganDecoder.mar",
-            model_path / "NCZSCosybigvganDecoder.mar",
-            model_path / "decoder" / "audio" / "NCCosybigvganDecoder.mar",
-            model_path / "decoder" / "audio" / "NCZSCosybigvganDecoder.mar",
-        ]
-        for candidate in candidates:
-            if candidate.exists():
-                return candidate
-        return None
-
-    def _extract_mar_checkpoint(self, mar_path: Path) -> tuple[str, str]:
-        extract_dir = Path(tempfile.mkdtemp(prefix="hcx_audio_decoder_"))
-        self._mar_extract_dir = str(extract_dir)
-
-        with zipfile.ZipFile(mar_path) as zf:
-            manifest = json.loads(zf.read("MAR-INF/MANIFEST.json"))
-            serialized_file = manifest.get("model", {}).get("serializedFile")
-            if not serialized_file:
-                raise ValueError(f"serializedFile not found in {mar_path}")
-
-            zf.extract(serialized_file, path=extract_dir)
-            zf.extract("config.json", path=extract_dir)
-
-        return str(extract_dir / serialized_file), str(extract_dir / "config.json")
 
     def _prepare_batch(
         self,
@@ -181,17 +163,18 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             if ref_audio is not None and not self.bigvgan.finetune:
                 ref_audio_bytes = base64.b64decode(
                     ref_audio.encode("ascii"), validate=True)
+                # Keep float32 to match ECAPA-TDNN model weights dtype.
                 ref_mel = (
                     self._get_reference_mel_spectrogram(
                         ref_audio_bytes, self.bigvgan.h)
-                    .to(self.device).to(self._dtype))
+                    .to(self.device))
                 batch.append((units, ref_mel, None))
             elif ref_audio is None and not self.bigvgan.finetune:
                 # Zero-shot decoder (ECAPA-TDNN) with no reference: use zero
                 # mel as fallback so text-only requests don't crash.
                 n_mels = int(getattr(self.bigvgan.h, "num_mels", 100))
-                ref_mel = torch.zeros(1, n_mels, 64,
-                                      device=self.device, dtype=self._dtype)
+                # float32 to match ECAPA-TDNN model weights dtype.
+                ref_mel = torch.zeros(1, n_mels, 64, device=self.device)
                 batch.append((units, ref_mel, None))
             else:
                 speaker = "fkms" if speaker is None else speaker
@@ -209,22 +192,24 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         return batch
 
     def forward(self, req: OmniDiffusionRequest) -> DiffusionOutput:
-        audio_tokens = req.extra.get("audio_tokens")
+        request_input = req.prompts[0].get("additional_information", None)
+        if request_input is None:
+            return DiffusionOutput(
+                output=None, error="additional_information required in request_input")
+
+        audio_tokens = request_input.get("audio_tokens")
         if audio_tokens is None:
             return DiffusionOutput(
                 output=None, error="audio_tokens required in req.extra")
 
-        # Default speakers to "fkms" for each sample when not provided
-        # (e.g., when called from the pipeline stage processor).
-        speakers = req.extra.get(
-            "speakers", ["fkms"] * len(audio_tokens))
+        speakers = request_input.get("speakers", ["fkms"]) * len(audio_tokens)
 
         if len(audio_tokens) != len(speakers):
             return DiffusionOutput(
                 output=None,
                 error="length of speakers and audio_tokens must be the same")
 
-        formats = req.extra.get(
+        formats = request_input.get(
             "formats", [DEFAULT_FORMAT.lower()] * len(audio_tokens))
         if len(audio_tokens) != len(formats):
             return DiffusionOutput(
@@ -233,7 +218,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
 
         # BUG FIX #2: Original PR #869 didn't handle None ref_audio_tokens,
         # causing len(None) TypeError
-        ref_audio_tokens = req.extra.get(
+        ref_audio_tokens = request_input.get(
             "ref_audio_tokens", [None] * len(audio_tokens))
         if len(audio_tokens) != len(ref_audio_tokens):
             return DiffusionOutput(
@@ -306,14 +291,10 @@ class HyperCLOVAXAudioPipeline(nn.Module):
     def load_weights(
         self, weights: Iterable[tuple[str, torch.Tensor]]
     ) -> set[str]:
-        # MAR checkpoint path already loads bigvgan weights eagerly.
-        if self._using_mar_checkpoint:
-            # Weights already loaded in __init__ via MAR extraction.
-            # Return all parameter names to pass the strict loading check.
-            return {name for name, _ in self.named_parameters()}
-
-        loader = AutoWeightsLoader(self)
-        return loader.load_weights(weights)
+        # Weights are loaded in __init__ from disk; satisfy strict loader checks.
+        for _ in weights:
+            pass
+        return {name for name, _ in self.named_parameters()}
 
     def _get_pad_multiple(self) -> int | None:
         pad_multiple_str = os.getenv("AUDIOLLM_PAD_MULTIPLE", "100")

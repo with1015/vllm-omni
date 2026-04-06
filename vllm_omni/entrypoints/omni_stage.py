@@ -1229,6 +1229,7 @@ async def _stage_worker_async(
                     engine_args.get("disable_log_stats", True) or getattr(omni_engine_args, "disable_log_stats", True)
                 ),
             )
+            import sys as _s; print("[DBG] Stage-0: from_vllm_config returned", flush=True, file=_s.stderr)
     if hasattr(stage_engine, "log_stats") and stage_engine.log_stats:
 
         async def _force_log():
@@ -1303,16 +1304,21 @@ async def _stage_worker_async(
         }
         # Only add is_tracing_enabled for LLM engines
         if stage_type != "diffusion":
+            import sys as _s2; print("[DBG] Stage-0: calling is_tracing_enabled", flush=True, file=_s2.stderr)
             stage_ready_payload["is_tracing_enabled"] = await stage_engine.is_tracing_enabled()
-        import pickle
+            print("[DBG] Stage-0: is_tracing_enabled done", flush=True, file=_s2.stderr)
+        import pickle as _pk, sys as _sp
         try:
-            pickle.loads(pickle.dumps(stage_ready_payload))
-        except Exception:
-            logger.warning("[Stage-%s] stage_ready_payload not picklable, dropping vllm_config/tokenizer", stage_id)
+            _tb = _pk.dumps(stage_ready_payload)
+            _pk.loads(_tb)
+            print(f"[DBG] Stage-0: pickle OK {len(_tb)}b", file=_sp.stderr, flush=True)
+        except Exception as _pe:
+            print(f"[DBG] Stage-0: pickle FAILED: {_pe}", file=_sp.stderr, flush=True)
             stage_ready_payload = {"type": "stage_ready", "stage_id": stage_id,
                                    "is_tracing_enabled": stage_ready_payload.get("is_tracing_enabled"),
                                    "vllm_config": None, "tokenizer": None}
         out_q.put(stage_ready_payload)
+        import sys as _s3; print("[DBG] Stage-0: stage_ready sent", flush=True, file=_s3.stderr)
     except Exception as e:
         logger.warning("Failed to send stage ready signal: %s", e)
     generation_out_q = asyncio.Queue()
