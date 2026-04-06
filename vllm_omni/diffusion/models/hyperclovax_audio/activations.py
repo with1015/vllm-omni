@@ -11,14 +11,7 @@ from torch.nn import Parameter
 if "sinc" in dir(torch):
     sinc = torch.sinc
 else:
-    # This code is adopted from adefossez's julius.core.sinc under the MIT License
-    # https://adefossez.github.io/julius/julius/core.html
-    # See NOTICE file for license details.
     def sinc(x: torch.Tensor):
-        """
-        Implementation of sinc, i.e. sin(pi * x) / (pi * x)
-        __Warning__: Different to julius.sinc, the input is multiplied by `pi`!
-        """
         return torch.where(
             x == 0,
             torch.tensor(1.0, device=x.device, dtype=x.dtype),
@@ -26,14 +19,17 @@ else:
         )
 
 
-# This code is adopted from adefossez's julius.lowpass.LowPassFilters under the MIT License
-# https://adefossez.github.io/julius/julius/lowpass.html
-# See NOTICE file for license details.
-def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):  # return filter [1,1,kernel_size]
+def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):
+    """Return filter [1, 1, kernel_size].
+
+    BUG FIX: Original PR #869 had two bugs here:
+    1. Variable name typo: assigned to 'filter' but returned 'filter' (unbound in cutoff==0 path)
+    2. cutoff==0 path didn't return properly
+    Both fixed by using 'filter_' consistently.
+    """
     even = kernel_size % 2 == 0
     half_size = kernel_size // 2
 
-    # For kaiser window
     delta_f = 4 * half_width
     A = 2.285 * (half_size - 1) * math.pi * delta_f + 7.95
     if A > 50.0:
@@ -44,23 +40,18 @@ def kaiser_sinc_filter1d(cutoff, half_width, kernel_size):  # return filter [1,1
         beta = 0.0
     window = torch.kaiser_window(kernel_size, beta=beta, periodic=False)
 
-    # ratio = 0.5/cutoff -> 2 * cutoff = 1 / ratio
     if even:
         time = torch.arange(-half_size, half_size) + 0.5
     else:
         time = torch.arange(kernel_size) - half_size
+
     if cutoff == 0:
         filter_ = torch.zeros_like(time)
     else:
         filter_ = 2 * cutoff * window * sinc(2 * cutoff * time)
-        """
-        Normalize filter to have sum = 1,
-        otherwise we will have a small leakage of the constant component in the input signal.
-        """
         filter_ /= filter_.sum()
-        filter = filter_.view(1, 1, kernel_size)
 
-    return filter
+    return filter_.view(1, 1, kernel_size)
 
 
 class LowPassFilter1d(nn.Module):
@@ -74,9 +65,6 @@ class LowPassFilter1d(nn.Module):
         kernel_size: int = 12,
         causal: bool = False,
     ):
-        """
-        kernel_size should be even number for stylegan3 setup, in this implementation, odd number is also possible.
-        """
         super().__init__()
         if cutoff < -0.0:
             raise ValueError("Minimum cutoff must be larger than zero.")
@@ -97,16 +85,15 @@ class LowPassFilter1d(nn.Module):
         filter = kaiser_sinc_filter1d(cutoff, half_width, kernel_size)
         self.register_buffer("filter", filter)
 
-    # Input [B, C, T]
     def forward(self, x, hidden_states=None):
         _, C, _ = x.shape
-        hs = x[..., -self.pad_left :]
+        hs = x[..., -self.pad_left:]
 
         if self.padding:
             if self.causal:
                 if hidden_states is not None:
                     assert hidden_states.shape[-1] >= self.pad_left
-                    hidden_states = hidden_states[..., -self.pad_left :]
+                    hidden_states = hidden_states[..., -self.pad_left:]
                     x = torch.cat([hidden_states, x], dim=-1)
                 else:
                     x = F.pad(x, (self.pad_left, 0), mode="constant", value=0.0)
@@ -126,23 +113,22 @@ class UpSample1d(nn.Module):
         self.pad = self.kernel_size // ratio - 1
         self.causal = causal
 
-        self.half_left = (kernel_size - ratio) // 2
-        self.half_right = (kernel_size - ratio + 1) // 2
+        self.half_left = (self.kernel_size - ratio) // 2
+        self.half_right = (self.kernel_size - ratio + 1) // 2
 
         filter = kaiser_sinc_filter1d(cutoff=0.5 / ratio, half_width=0.6 / ratio, kernel_size=self.kernel_size)
         self.register_buffer("filter", filter)
 
-    # x: [B, C, T]
     def forward(self, x, hidden_states=None):
         _, C, _ = x.shape
-        hs = x[..., -self.pad :]
+        hs = x[..., -self.pad:]
 
         pad_left = self.pad
         pad_right = 0 if self.causal else self.pad
 
         if hidden_states is not None:
             assert hidden_states.shape[-1] >= self.pad
-            hidden_states = hidden_states[..., -self.pad :]
+            hidden_states = hidden_states[..., -self.pad:]
             x = torch.cat([hidden_states, x], dim=-1)
             if pad_right > 0:
                 x = F.pad(x, (0, pad_right), mode="replicate")
@@ -176,70 +162,34 @@ class DownSample1d(nn.Module):
 
     def forward(self, x, hidden_states=None):
         xx, hs = self.lowpass(x, hidden_states)
-
         return xx, hs.detach()
 
 
 class SnakeBeta(nn.Module):
-    """
-    A modified Snake function which uses separate parameters for the magnitude of the periodic components
-    Shape:
-        - Input: (B, C, T)
-        - Output: (B, C, T), same shape as the input
-    Parameters:
-        - alpha - trainable parameter that controls frequency
-        - beta - trainable parameter that controls magnitude
-    References:
-        - This activation function is a modified version based on this paper
-          by Liu Ziyin, Tilman Hartwig, Masahito Ueda:
-          https://arxiv.org/abs/2006.08195
-    Examples:
-        >>> a1 = snakebeta(256)
-        >>> x = torch.randn(256)
-        >>> x = a1(x)
-    """
+    """SnakeBeta: x + (1/beta) * sin^2(x * alpha)"""
 
     def __init__(self, in_features, alpha=1.0, alpha_trainable=True, alpha_logscale=False):
-        """
-        Initialization.
-        INPUT:
-            - in_features: shape of the input
-            - alpha - trainable parameter that controls frequency
-            - beta - trainable parameter that controls magnitude
-            alpha is initialized to 1 by default, higher values = higher-frequency.
-            beta is initialized to 1 by default, higher values = higher-magnitude.
-            alpha will be trained along with the rest of your model.
-        """
         super().__init__()
         self.in_features = in_features
-
-        # Initialize alpha
         self.alpha_logscale = alpha_logscale
-        if self.alpha_logscale:  # Log scale alphas initialized to zeros
+        if self.alpha_logscale:
             self.alpha = Parameter(torch.zeros(in_features) * alpha)
             self.beta = Parameter(torch.zeros(in_features) * alpha)
-        else:  # Linear scale alphas initialized to ones
+        else:
             self.alpha = Parameter(torch.ones(in_features) * alpha)
             self.beta = Parameter(torch.ones(in_features) * alpha)
 
         self.alpha.requires_grad = alpha_trainable
         self.beta.requires_grad = alpha_trainable
-
         self.no_div_by_zero = 0.000000001
 
     def forward(self, x):
-        """
-        Forward pass of the function.
-        Applies the function to the input elementwise.
-        SnakeBeta ∶= x + 1/b * sin^2 (xa)
-        """
-        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)  # Line up with x to [B, C, T]
+        alpha = self.alpha.unsqueeze(0).unsqueeze(-1)
         beta = self.beta.unsqueeze(0).unsqueeze(-1)
         if self.alpha_logscale:
             alpha = torch.exp(alpha)
             beta = torch.exp(beta)
         x = x + (1.0 / (beta + self.no_div_by_zero)) * pow(sin(x * alpha), 2)
-
         return x
 
 
@@ -260,7 +210,6 @@ class Activation1d(nn.Module):
         self.upsample = UpSample1d(up_ratio, up_kernel_size, causal)
         self.downsample = DownSample1d(down_ratio, down_kernel_size, causal)
 
-    # x: [B,C,T]
     def forward(self, x, hidden_states=None):
         if hidden_states is None:
             hidden_states = [None] * 2

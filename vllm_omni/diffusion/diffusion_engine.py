@@ -415,21 +415,46 @@ class DiffusionEngine:
         prompt = "dummy run"
         # note that num_inference_steps=1 will cause timestep and temb None in the pipeline
         num_inference_steps = 1
-        height = 1024
-        width = 1024
+        height = 256
+        width = 256
         if supports_image_input(self.od_config.model_class_name):
             # Provide a dummy image input if the model supports it
 
             dummy_image = PIL.Image.new("RGB", (width, height), color=(0, 0, 0))
         else:
-            dummy_image = None
+            dummy_audio = None
+
+        # Collect dummy extra tokens from the pipeline class if available.
+        # Some pipelines (e.g. HyperCLOVAXVisionPipeline) require tokens in
+        # req.extra that are normally populated by stage input processors.
+        model_cls = DiffusionModelRegistry._try_load_model_cls(
+            self.od_config.model_class_name
+        )
+        dummy_extra = {}
+        if model_cls is not None and hasattr(model_cls, "get_dummy_extra"):
+            dummy_extra = model_cls.get_dummy_extra()
+
+        prompt: OmniTextPrompt = {
+            "prompt": "dummy run",
+            "multi_modal_data": {"image": dummy_image, "audio": dummy_audio},
+        }
         req = OmniDiffusionRequest(
-            prompt=prompt,
-            height=height,
-            width=width,
-            pil_image=dummy_image,
-            num_inference_steps=num_inference_steps,
-            num_outputs_per_prompt=1,
+            prompts=[prompt],
+            request_ids=["dummy_req_id"],
+            extra=dummy_extra,
+            sampling_params=OmniDiffusionSamplingParams(
+                height=height,
+                width=width,
+                num_inference_steps=num_inference_steps,
+                # Keep warmup path minimal and robust across text encoders.
+                # Some models may fail when warmup implicitly triggers
+                # classifier-free guidance with an empty negative prompt.
+                guidance_scale=0.0,
+                num_outputs_per_prompt=1,
+                # Disable CFG for warmup to avoid triggering CFG parallel
+                # validation when cfg_parallel_size > 1.
+                extra_args={"cfg_text_scale": 1.0, "cfg_img_scale": 1.0},
+            ),
         )
         logger.info("dummy run to warm up the model")
         requests = self.pre_process_func([req]) if self.pre_process_func is not None else [req]
