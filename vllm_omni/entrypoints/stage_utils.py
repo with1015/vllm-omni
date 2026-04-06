@@ -12,12 +12,21 @@ from omegaconf import OmegaConf
 logger = logging.getLogger(__name__)
 
 
-class OmniStageTaskType(enum.Enum):
-    GENERATE = "generate"
-    ABORT = "abort"
-    SHUTDOWN = "shutdown"
-    PROFILER_START = "profiler_start"
-    PROFILER_STOP = "profiler_stop"
+def set_stage_devices(
+    stage_id: int,
+    devices: str | int | None,
+    device_type: str | None = None,
+) -> str | None:
+    """Configure per-stage device visibility and current device (CUDA or NPU).
+
+    This function sets environment variables that control which devices are visible
+    to the process. It must be called BEFORE worker initialization so that workers
+    see the correct devices.
+
+
+    NOTE: This will set the control variable for the appropriate platform.
+        - CUDA: CUDA_VISIBLE_DEVICES
+        - NPU: ASCEND_RT_VISIBLE_DEVICES
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
@@ -288,3 +297,78 @@ def _to_dict(x: Any) -> dict[str, Any]:
             return dict(x)
         except Exception:
             return {}
+import enum
+import json
+from multiprocessing import shared_memory as _shm
+
+import enum
+
+class OmniStageTaskType(enum.Enum):
+    GENERATE = "generate"
+    ABORT = "abort"
+    SHUTDOWN = "shutdown"
+    PROFILER_START = "profiler_start"
+    PROFILER_STOP = "profiler_stop"
+
+
+SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}
+
+
+def is_profiler_task(task_type: OmniStageTaskType) -> bool:
+    return task_type in (OmniStageTaskType.PROFILER_START, OmniStageTaskType.PROFILER_STOP)
+
+def maybe_dump_to_shm(obj, threshold: int) -> tuple:
+    """Dump object to SHM if serialized size exceeds threshold."""
+    payload = serialize_obj(obj)
+    if len(payload) > threshold:
+        return True, shm_write_bytes(payload, name=None)
+    return False, obj
+
+def _resolve_model_tokenizer_paths(
+    model: str,
+    engine_args: dict,
+) -> str:
+    """Resolve model and tokenizer paths for non-standard directory structures.
+
+    Some models (e.g., GLM-Image) have tokenizer in root and model in subdirectory.
+    This function handles model_subdir and tokenizer_subdir engine_args.
+
+    Args:
+        model: Base model path
+        engine_args: Engine arguments (modified in-place to remove subdir args
+            and set tokenizer if needed)
+
+    Returns:
+        Resolved model path (may be subdirectory of original)
+    """
+    import os
+
+    model_subdir = engine_args.pop("model_subdir", None)
+    tokenizer_subdir = engine_args.pop("tokenizer_subdir", None)
+    base_model_path = model
+
+    if model_subdir:
+        model = os.path.join(model, model_subdir)
+        logger.info(f"Using model subdirectory: {model}")
+
+    if tokenizer_subdir is not None:
+        tokenizer_path = os.path.join(base_model_path, tokenizer_subdir) if tokenizer_subdir else base_model_path
+        engine_args["tokenizer"] = tokenizer_path
+        logger.info(f"Using tokenizer from: {tokenizer_path}")
+    elif model_subdir and "tokenizer" not in engine_args:
+        engine_args["tokenizer"] = base_model_path
+        logger.info(f"Using tokenizer from base model path: {base_model_path}")
+
+    return model
+
+def maybe_load_from_ipc(container: dict[str, Any], obj_key: str, shm_key: str) -> Any:
+    """Load object from container that may carry SHM or inline object.
+
+    Deprecated: prefer `maybe_load_from_ipc_with_metrics` to also obtain
+    decode-time and size metrics.
+    """
+    if shm_key in container:
+        from vllm_omni.distributed.omni_connectors.utils.serialization import OmniSerializer
+
+        return OmniSerializer.deserialize(shm_read_bytes(container[shm_key]))
+    return container[obj_key]

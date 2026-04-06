@@ -1,7 +1,6 @@
 from dataclasses import dataclass
 
-from transformers.models.qwen3_omni_moe.configuration_qwen3_omni_moe import Qwen3OmniMoeTextConfig
-from vllm.engine.arg_utils import EngineArgs
+from vllm.engine.arg_utils import AsyncEngineArgs, EngineArgs
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_text_config
 from vllm.v1.engine.async_llm import AsyncEngineArgs
@@ -103,21 +102,18 @@ class OmniEngineArgs(EngineArgs):
 
         return omni_config
 
+    @property
+    def output_modality(self) -> OutputModality:
+        """Parse engine_output_type into a type-safe OutputModality flag."""
+        return OutputModality.from_string(self.engine_output_type)
+
 
 @dataclass
 class AsyncOmniEngineArgs(AsyncEngineArgs):
-    """Async engine arguments for omni models, extending base AsyncEngineArgs.
-    Adds omni-specific configuration fields for multi-stage pipeline
-    processing and output type specification in async contexts.
-    Args:
-        stage_id: Identifier for the stage in a multi-stage pipeline (default: 0)
-        model_stage: Stage type identifier, e.g., "thinker" or "talker"
-            (default: "thinker")
-        model_arch: Model architecture name
-            (default: "Qwen2_5OmniForConditionalGeneration")
-        engine_output_type: Optional output type specification for the engine.
-            Used to route outputs to appropriate processors (e.g., "image",
-            "audio", "latents"). If None, output type is inferred.
+    """Async engine arguments for omni LLM stages.
+
+    Extends AsyncEngineArgs with omni-specific multi-stage pipeline fields.
+    Used when launching LLM stages (stage_type=llm) within an async context.
     """
 
     stage_id: int = 0
@@ -125,53 +121,22 @@ class AsyncOmniEngineArgs(AsyncEngineArgs):
     model_arch: str = "Qwen2_5OmniForConditionalGeneration"
     engine_output_type: str | None = None
     hf_config_name: str | None = None
+    custom_process_next_stage_input_func: str | None = None
+    stage_connector_spec: dict[str, Any] = field(default_factory=dict)
+    async_chunk: bool = False
+    omni_kv_config: dict | None = None
+    quantization_config: Any | None = None
+    worker_type: str | None = None
 
-    def draw_hf_text_config(self, config_dict: dict) -> Qwen3OmniMoeTextConfig:
-        # transformers' get_text_config method is used to get the text config from thinker_config.
-        # to handle the case that each model stage has their own text config,
-        # we need to draw the text config from the corresponding model stage.
-        hf_config = config_dict["hf_config"]
-        hf_config_name = config_dict["hf_config_name"]
-        try:
-            # Try to get the stage-specific config (e.g., thinker_config, talker_config)
-            stage_config = getattr(hf_config, hf_config_name)
-            return stage_config.get_text_config()
-        except AttributeError:
-            # Fallback: if the attribute doesn't exist, use the default get_hf_text_config
-            logger.warning(
-                f"Config attribute '{hf_config_name}' not found in hf_config, "
-                "falling back to default get_hf_text_config"
-            )
-            return get_hf_text_config(hf_config)
+    def __post_init__(self) -> None:
+        load_omni_general_plugins()
+        super().__post_init__()
 
-    def _ensure_omni_models_registered(self):
-        if hasattr(self, "_omni_models_registered"):
-            return True
-        register_omni_models_to_vllm()
-        self._omni_models_registered = True
-        return True
-
-    def create_model_config(self) -> OmniModelConfig:
-        # register omni models to avoid model not found error
-        self._ensure_omni_models_registered()
-        # First, get the base ModelConfig from the parent class
-        base_config = super().create_model_config()
-
-        # Create OmniModelConfig by copying all base config attributes
-        # and adding the new omni-specific fields
-        config_dict = base_config.__dict__.copy()
-
-        # Add the new omni-specific fields
-        config_dict["stage_id"] = self.stage_id
-        config_dict["model_stage"] = self.model_stage
-        config_dict["model_arch"] = self.model_arch
-        config_dict["engine_output_type"] = self.engine_output_type
-
-        config_dict["hf_config_name"] = self.hf_config_name
-        if self.hf_config_name is not None:
-            config_dict["hf_text_config"] = self.draw_hf_text_config(config_dict)
-        # Create and return the OmniModelConfig instance
-        omni_config = OmniModelConfig(**config_dict)
-        omni_config.hf_config.architectures = omni_config.architectures
-
-        return omni_config
+    def create_engine_config(self, usage_context=None, **kwargs):
+        """Create engine config, injecting model_arch into hf_overrides if set."""
+        if self.model_arch:
+            if self.hf_overrides is None:
+                self.hf_overrides = {}
+            if isinstance(self.hf_overrides, dict):
+                self.hf_overrides.setdefault("architectures", [self.model_arch])
+        return super().create_engine_config(usage_context=usage_context, **kwargs)
