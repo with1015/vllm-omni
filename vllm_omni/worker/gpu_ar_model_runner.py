@@ -427,7 +427,7 @@ class GPUARModelRunner(OmniGPUModelRunner):
                 sampled_token_ids=valid_sampled_token_ids,
                 logprobs=logprobs_lists,
                 prompt_logprobs_dict=prompt_logprobs_dict,
-                pooler_output=(pooler_output if self.vllm_config.model_config.engine_output_type != "text" else None),
+                pooler_output=(pooler_output if getattr(self.vllm_config.model_config, "engine_output_type", "text") != "text" else None),
                 kv_connector_output=kv_connector_output,
                 ec_connector_output=ec_connector_output if self.supports_mm_inputs else None,
                 num_nans_in_logits=num_nans_in_logits,
