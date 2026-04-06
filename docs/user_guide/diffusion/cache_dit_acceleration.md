@@ -18,7 +18,6 @@ Enable cache-dit acceleration by simply setting `cache_backend="cache_dit"`. Cac
 
 ```python
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
 
 # Simplest way: just enable cache-dit with default parameters
 omni = Omni(
@@ -28,7 +27,7 @@ omni = Omni(
 
 images = omni.generate(
     "a beautiful landscape",
-    OmniDiffusionSamplingParams(num_inference_steps=50),
+    num_inference_steps=50,
 )
 ```
 
@@ -188,8 +187,8 @@ cd examples/offline_inference/text_to_image
 python text_to_image.py \
     --model Qwen/Qwen-Image \
     --prompt "a cup of coffee on the table" \
-    --cache-backend cache_dit \
-    --num-inference-steps 50
+    --cache_backend cache_dit \
+    --num_inference_steps 50
 ```
 
 

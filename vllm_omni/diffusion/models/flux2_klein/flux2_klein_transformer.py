@@ -17,7 +17,7 @@
 
 from collections.abc import Iterable
 from types import SimpleNamespace
-from typing import TYPE_CHECKING, Any
+from typing import Any
 
 import torch
 import torch.nn as nn
@@ -29,20 +29,12 @@ from diffusers.models.embeddings import (
 from diffusers.models.modeling_outputs import Transformer2DModelOutput
 from diffusers.models.normalization import AdaLayerNormContinuous
 from vllm.model_executor.layers.layernorm import RMSNorm
-from vllm.model_executor.layers.linear import (
-    ColumnParallelLinear,
-    MergedColumnParallelLinear,
-    QKVParallelLinear,
-    RowParallelLinear,
-)
+from vllm.model_executor.layers.linear import QKVParallelLinear, ReplicatedLinear
 from vllm.model_executor.model_loader.weight_utils import default_weight_loader
 
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.layer import Attention
 from vllm_omni.diffusion.layers.rope import RotaryEmbedding
-
-if TYPE_CHECKING:
-    from vllm.model_executor.layers.quantization.base_config import QuantizationConfig
 
 
 class Flux2SwiGLU(nn.Module):
@@ -65,29 +57,15 @@ class Flux2FeedForward(nn.Module):
         mult: float = 3.0,
         inner_dim: int | None = None,
         bias: bool = False,
-        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         if inner_dim is None:
             inner_dim = int(dim * mult)
         dim_out = dim_out or dim
 
-        self.linear_in = MergedColumnParallelLinear(
-            dim,
-            [inner_dim, inner_dim],
-            bias=bias,
-            return_bias=False,
-            quant_config=quant_config,
-        )
+        self.linear_in = nn.Linear(dim, inner_dim * 2, bias=bias)
         self.act_fn = Flux2SwiGLU()
-        self.linear_out = RowParallelLinear(
-            inner_dim,
-            dim_out,
-            bias=bias,
-            input_is_parallel=True,
-            return_bias=False,
-            quant_config=quant_config,
-        )
+        self.linear_out = nn.Linear(inner_dim, dim_out, bias=bias)
 
     def forward(self, x: torch.Tensor) -> torch.Tensor:
         x = self.linear_in(x)
@@ -109,7 +87,6 @@ class Flux2Attention(nn.Module):
         eps: float = 1e-5,
         out_dim: int = None,
         elementwise_affine: bool = True,
-        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -124,27 +101,15 @@ class Flux2Attention(nn.Module):
             hidden_size=query_dim,
             head_size=self.head_dim,
             total_num_heads=self.heads,
+            disable_tp=True,
             bias=bias,
-            quant_config=quant_config,
         )
-        self.query_num_heads = self.to_qkv.num_heads
-        self.kv_num_heads = self.to_qkv.num_kv_heads
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
         self.to_out = nn.ModuleList(
-            [
-                RowParallelLinear(
-                    self.inner_dim,
-                    self.out_dim,
-                    bias=out_bias,
-                    input_is_parallel=True,
-                    return_bias=False,
-                    quant_config=quant_config,
-                ),
-                nn.Dropout(dropout),
-            ]
+            [ReplicatedLinear(self.inner_dim, self.out_dim, bias=out_bias), nn.Dropout(dropout)]
         )
 
         if added_kv_proj_dim is not None:
@@ -154,27 +119,17 @@ class Flux2Attention(nn.Module):
                 hidden_size=added_kv_proj_dim,
                 head_size=self.head_dim,
                 total_num_heads=self.heads,
+                disable_tp=True,
                 bias=added_proj_bias,
-                quant_config=quant_config,
             )
-            self.add_query_num_heads = self.add_kv_proj.num_heads
-            self.add_kv_num_heads = self.add_kv_proj.num_kv_heads
-            self.to_add_out = RowParallelLinear(
-                self.inner_dim,
-                query_dim,
-                bias=out_bias,
-                input_is_parallel=True,
-                return_bias=False,
-                quant_config=quant_config,
-            )
+            self.to_add_out = ReplicatedLinear(self.inner_dim, query_dim, bias=out_bias)
 
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
-            num_heads=self.query_num_heads,
+            num_heads=self.heads,
             head_size=self.head_dim,
             softmax_scale=1.0 / (self.head_dim**0.5),
             causal=False,
-            num_kv_heads=self.kv_num_heads,
         )
 
     def forward(
@@ -193,17 +148,17 @@ class Flux2Attention(nn.Module):
             encoder_qkv, _ = self.add_kv_proj(encoder_hidden_states)
             encoder_query, encoder_key, encoder_value = encoder_qkv.chunk(3, dim=-1)
 
-        query = query.unflatten(-1, (self.query_num_heads, -1))
-        key = key.unflatten(-1, (self.kv_num_heads, -1))
-        value = value.unflatten(-1, (self.kv_num_heads, -1))
+        query = query.unflatten(-1, (self.heads, -1))
+        key = key.unflatten(-1, (self.heads, -1))
+        value = value.unflatten(-1, (self.heads, -1))
 
         query = self.norm_q(query)
         key = self.norm_k(key)
 
         if encoder_hidden_states is not None and self.added_kv_proj_dim is not None:
-            encoder_query = encoder_query.unflatten(-1, (self.add_query_num_heads, -1))
-            encoder_key = encoder_key.unflatten(-1, (self.add_kv_num_heads, -1))
-            encoder_value = encoder_value.unflatten(-1, (self.add_kv_num_heads, -1))
+            encoder_query = encoder_query.unflatten(-1, (self.heads, -1))
+            encoder_key = encoder_key.unflatten(-1, (self.heads, -1))
+            encoder_value = encoder_value.unflatten(-1, (self.heads, -1))
 
             encoder_query = self.norm_added_q(encoder_query)
             encoder_key = self.norm_added_k(encoder_key)
@@ -234,9 +189,9 @@ class Flux2Attention(nn.Module):
                 [context_len, hidden_states.shape[1] - context_len],
                 dim=1,
             )
-            encoder_hidden_states = self.to_add_out(encoder_hidden_states)
+            encoder_hidden_states, _ = self.to_add_out(encoder_hidden_states)
 
-        hidden_states = self.to_out[0](hidden_states)
+        hidden_states, _ = self.to_out[0](hidden_states)
         hidden_states = self.to_out[1](hidden_states)
 
         if encoder_hidden_states is not None:
@@ -262,7 +217,6 @@ class Flux2ParallelSelfAttention(nn.Module):
         elementwise_affine: bool = True,
         mlp_ratio: float = 4.0,
         mlp_mult_factor: int = 2,
-        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.head_dim = dim_head
@@ -276,25 +230,17 @@ class Flux2ParallelSelfAttention(nn.Module):
         self.mlp_hidden_dim = int(query_dim * self.mlp_ratio)
         self.mlp_mult_factor = mlp_mult_factor
 
-        self.to_qkv_mlp_proj = ColumnParallelLinear(
+        self.to_qkv_mlp_proj = nn.Linear(
             self.query_dim,
             self.inner_dim * 3 + self.mlp_hidden_dim * self.mlp_mult_factor,
             bias=bias,
-            gather_output=True,
-            quant_config=quant_config,
         )
         self.mlp_act_fn = Flux2SwiGLU()
 
         self.norm_q = RMSNorm(dim_head, eps=eps)
         self.norm_k = RMSNorm(dim_head, eps=eps)
 
-        self.to_out = ColumnParallelLinear(
-            self.inner_dim + self.mlp_hidden_dim,
-            self.out_dim,
-            bias=out_bias,
-            gather_output=True,
-            quant_config=quant_config,
-        )
+        self.to_out = nn.Linear(self.inner_dim + self.mlp_hidden_dim, self.out_dim, bias=out_bias)
         self.rope = RotaryEmbedding(is_neox_style=False)
         self.attn = Attention(
             num_heads=self.heads,
@@ -310,7 +256,7 @@ class Flux2ParallelSelfAttention(nn.Module):
         image_rotary_emb: tuple[torch.Tensor, torch.Tensor] | None = None,
         **kwargs,
     ) -> torch.Tensor:
-        hidden_states, _ = self.to_qkv_mlp_proj(hidden_states)
+        hidden_states = self.to_qkv_mlp_proj(hidden_states)
         qkv, mlp_hidden_states = torch.split(
             hidden_states,
             [3 * self.inner_dim, self.mlp_hidden_dim * self.mlp_mult_factor],
@@ -343,8 +289,7 @@ class Flux2ParallelSelfAttention(nn.Module):
 
         mlp_hidden_states = self.mlp_act_fn(mlp_hidden_states)
         hidden_states = torch.cat([attn_output, mlp_hidden_states], dim=-1)
-        hidden_states, _ = self.to_out(hidden_states)
-        return hidden_states
+        return self.to_out(hidden_states)
 
 
 class Flux2SingleTransformerBlock(nn.Module):
@@ -356,7 +301,6 @@ class Flux2SingleTransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
-        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.norm = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -370,7 +314,6 @@ class Flux2SingleTransformerBlock(nn.Module):
             eps=eps,
             mlp_ratio=mlp_ratio,
             mlp_mult_factor=2,
-            quant_config=quant_config,
         )
 
     def forward(
@@ -418,7 +361,6 @@ class Flux2TransformerBlock(nn.Module):
         mlp_ratio: float = 3.0,
         eps: float = 1e-6,
         bias: bool = False,
-        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.norm1 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
@@ -434,20 +376,13 @@ class Flux2TransformerBlock(nn.Module):
             added_proj_bias=bias,
             out_bias=bias,
             eps=eps,
-            quant_config=quant_config,
         )
 
         self.norm2 = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias, quant_config=quant_config)
+        self.ff = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
 
         self.norm2_context = nn.LayerNorm(dim, elementwise_affine=False, eps=eps)
-        self.ff_context = Flux2FeedForward(
-            dim=dim,
-            dim_out=dim,
-            mult=mlp_ratio,
-            bias=bias,
-            quant_config=quant_config,
-        )
+        self.ff_context = Flux2FeedForward(dim=dim, dim_out=dim, mult=mlp_ratio, bias=bias)
 
     def forward(
         self,
@@ -583,10 +518,6 @@ class Flux2Transformer2DModel(nn.Module):
     """
 
     _repeated_blocks = ["Flux2TransformerBlock", "Flux2SingleTransformerBlock"]
-    packed_modules_mapping = {
-        "to_qkv": ["to_q", "to_k", "to_v"],
-        "add_kv_proj": ["add_q_proj", "add_k_proj", "add_v_proj"],
-    }
 
     def __init__(
         self,
@@ -604,7 +535,6 @@ class Flux2Transformer2DModel(nn.Module):
         rope_theta: int = 2000,
         eps: float = 1e-6,
         guidance_embeds: bool = True,
-        quant_config: "QuantizationConfig | None" = None,
     ):
         super().__init__()
         self.out_channels = out_channels or in_channels
@@ -650,7 +580,6 @@ class Flux2Transformer2DModel(nn.Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
-                    quant_config=quant_config,
                 )
                 for _ in range(num_layers)
             ]
@@ -665,7 +594,6 @@ class Flux2Transformer2DModel(nn.Module):
                     mlp_ratio=mlp_ratio,
                     eps=eps,
                     bias=False,
-                    quant_config=quant_config,
                 )
                 for _ in range(num_single_layers)
             ]
@@ -755,9 +683,9 @@ class Flux2Transformer2DModel(nn.Module):
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:
         stacked_params_mapping = [
-            (".to_qkv.", ".to_q.", "q"),
-            (".to_qkv.", ".to_k.", "k"),
-            (".to_qkv.", ".to_v.", "v"),
+            (".to_qkv", ".to_q", "q"),
+            (".to_qkv", ".to_k", "k"),
+            (".to_qkv", ".to_v", "v"),
             (".add_kv_proj", ".add_q_proj", "q"),
             (".add_kv_proj", ".add_k_proj", "k"),
             (".add_kv_proj", ".add_v_proj", "v"),
@@ -771,32 +699,25 @@ class Flux2Transformer2DModel(nn.Module):
 
         loaded_params: set[str] = set()
         for name, loaded_weight in weights:
-            original_name = name
-            mapped = False
+            if "to_qkvkv_mlp_proj" in name:
+                name = name.replace("to_qkvkv_mlp_proj", "to_qkv_mlp_proj")
+            if "to_qkv_mlp_proj" in name:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
+                loaded_params.add(name)
+                continue
             for param_name, weight_name, shard_id in stacked_params_mapping:
-                if weight_name not in original_name:
+                if weight_name not in name:
                     continue
-                name = original_name.replace(weight_name, param_name)
-                param = params_dict.get(name)
-                if param is None:
-                    break
+                name = name.replace(weight_name, param_name)
+                param = params_dict[name]
                 weight_loader = param.weight_loader
                 weight_loader(param, loaded_weight, shard_id)
-                loaded_params.add(name)
-                mapped = True
                 break
-            if mapped:
-                continue
-
-            name = original_name
-            if name not in params_dict and ".to_out.0." in name:
-                name = name.replace(".to_out.0.", ".to_out.")
-            # Some GGUF checkpoints include quantized tensors for modules that
-            # are intentionally left unquantized in this model.
-            param = params_dict.get(name)
-            if param is None:
-                continue
-            weight_loader = getattr(param, "weight_loader", default_weight_loader)
-            weight_loader(param, loaded_weight)
+            else:
+                param = params_dict[name]
+                weight_loader = getattr(param, "weight_loader", default_weight_loader)
+                weight_loader(param, loaded_weight)
             loaded_params.add(name)
         return loaded_params

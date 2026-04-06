@@ -27,10 +27,8 @@ from vllm.model_executor.models.utils import AutoWeightsLoader
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
-from vllm_omni.diffusion.models.interface import SupportAudioOutput
 from vllm_omni.diffusion.models.stable_audio.stable_audio_transformer import StableAudioDiTModel
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.diffusion.utils.tf_utils import get_transformer_config_kwargs
 
 logger = init_logger(__name__)
 
@@ -59,7 +57,7 @@ def get_stable_audio_post_process_func(
     return post_process_func
 
 
-class StableAudioPipeline(nn.Module, SupportAudioOutput):
+class StableAudioPipeline(nn.Module):
     """
     Pipeline for text-to-audio generation using Stable Audio Open.
 
@@ -128,9 +126,8 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             local_files_only=local_files_only,
         ).to(self.device)
 
-        # Initialize transformer from HF config to keep architecture aligned with checkpoint.
-        transformer_kwargs = get_transformer_config_kwargs(od_config.tf_model_config, StableAudioDiTModel)
-        self.transformer = StableAudioDiTModel(od_config=od_config, **transformer_kwargs)
+        # Initialize our custom transformer (weights loaded via load_weights)
+        self.transformer = StableAudioDiTModel(od_config=od_config)
 
         # Load scheduler
         self.scheduler = CosineDPMSolverMultistepScheduler.from_pretrained(
@@ -334,7 +331,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         sample_size: int,
         dtype: torch.dtype,
         device: torch.device,
-        generator: torch.Generator | list[torch.Generator] | None,
+        generator: torch.Generator | None,
         latents: torch.Tensor | None = None,
     ) -> torch.Tensor:
         """Prepare initial latent noise."""
@@ -349,6 +346,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         latents = latents * self.scheduler.init_noise_sigma
         return latents
 
+    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
@@ -359,7 +357,7 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
         num_inference_steps: int = 100,
         guidance_scale: float = 7.0,
         num_waveforms_per_prompt: int = 1,
-        generator: torch.Generator | list[torch.Generator] | None = None,
+        generator: torch.Generator | None = None,
         latents: torch.Tensor | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
@@ -387,26 +385,20 @@ class StableAudioPipeline(nn.Module, SupportAudioOutput):
             DiffusionOutput containing generated audio
         """
         # Extract from request
-        # TODO: In online mode, sometimes it receives [{"negative_prompt": None}, {...}], so cannot use .get("...", "")
-        # TODO: May be some data formatting operations on the API side. Hack for now.
-        prompt = [p if isinstance(p, str) else (p.get("prompt") or "") for p in req.prompts] or prompt
-        if all(isinstance(p, str) or p.get("negative_prompt") is None for p in req.prompts):
-            negative_prompt = None
-        elif req.prompts:
-            negative_prompt = ["" if isinstance(p, str) else (p.get("negative_prompt") or "") for p in req.prompts]
-
-        num_inference_steps = req.sampling_params.num_inference_steps or num_inference_steps
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        prompt = req.prompt if req.prompt is not None else prompt
+        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
+        num_inference_steps = req.num_inference_steps or num_inference_steps
+        if req.guidance_scale_provided:
+            guidance_scale = req.guidance_scale
 
         if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=self.device).manual_seed(req.sampling_params.seed)
+            generator = req.generator
+        if generator is None and req.seed is not None:
+            generator = torch.Generator(device=self.device).manual_seed(req.seed)
 
         # Get audio duration from request extra params or defaults
-        audio_start_in_s = req.sampling_params.extra_args.get("audio_start_in_s", audio_start_in_s)
-        audio_end_in_s = req.sampling_params.extra_args.get("audio_end_in_s", audio_end_in_s)
+        audio_start_in_s = req.extra.get("audio_start_in_s", audio_start_in_s)
+        audio_end_in_s = req.extra.get("audio_end_in_s", audio_end_in_s)
 
         # Calculate audio length
         downsample_ratio = self.vae.hop_length

@@ -478,7 +478,14 @@ class AsyncOmni(OmniBase):
         sampling_params_list: list[SamplingParams],
         prompt: Any,
     ) -> AsyncGenerator[OmniRequestOutput, None]:
+        # Track stages that were never submitted (no inputs); skip waiting for them.
+        # This handles the fan-out topology where Stage-0 forwards to BOTH Stage-1
+        # (vision decoder) and Stage-2 (audio decoder) independently, based on
+        # which token types appeared in Stage-0 output.
+        skipped_stages: set[int] = set()
         for stage_id, stage in enumerate(self.stage_list[: final_stage_id_for_e2e + 1]):
+            if stage_id in skipped_stages:
+                continue
             finished = False
             while not finished:
                 result = await req_state.queue.get()
@@ -494,19 +501,28 @@ class AsyncOmni(OmniBase):
             if not isinstance(engine_outputs, list):
                 engine_outputs = [engine_outputs]
             stage.set_engine_outputs(engine_outputs)
-            # Forward to next stage if there is one
-            next_stage_id = stage_id + 1
-            if next_stage_id <= final_stage_id_for_e2e:
+            # Forward to all subsequent stages whose engine_input_source includes
+            # this stage. Both Stage-1 (vision) and Stage-2 (audio) source from
+            # Stage-0 independently, so we must try both after Stage-0 completes.
+            any_forwarded = False
+            for next_stage_id in range(stage_id + 1, final_stage_id_for_e2e + 1):
                 next_stage: OmniStage = self.stage_list[next_stage_id]
+                if stage_id not in getattr(next_stage, "engine_input_source", []):
+                    continue
                 # Derive inputs for the next stage, record postprocess time
                 with metrics.stage_postprocess_timer(stage_id, request_id):
                     next_inputs = next_stage.process_engine_inputs(self.stage_list, prompt)
                 sp_next: SamplingParams = sampling_params_list[next_stage_id]
-
+                if not next_inputs:
+                    logger.warning(
+                        "[%s] No inputs for stage-%s (request %s), skipping forward",
+                        self._name, next_stage_id, request_id,
+                    )
+                    skipped_stages.add(next_stage_id)
+                    continue
                 # Check if we have a connector for this edge
                 connector_key = (str(stage_id), str(next_stage_id))
                 connector = self.connectors.get(connector_key)
-
                 sent_via_connector = False
                 if connector:
                     sent_via_connector = try_send_via_connector(
@@ -520,7 +536,6 @@ class AsyncOmni(OmniBase):
                         next_stage_queue_submit_fn=self.stage_list[next_stage_id].submit,
                         metrics=metrics,
                     )
-
                 if not sent_via_connector:
                     # Fallback logic removed as we now enforce connector usage.
                     # If no connector is found or send fails, we log an error and raise,
@@ -533,8 +548,9 @@ class AsyncOmni(OmniBase):
                     logger.error(error_msg)
                     raise RuntimeError(error_msg)
                 logger.debug(f"[{self._name}] Forwarded request {request_id} to stage-{next_stage_id}")
-            else:
-                logger.debug(f"[{self._name}] Request {request_id} fully completed")
+                any_forwarded = True
+            if not any_forwarded:
+                logger.debug(f"[{self._name}] Request {request_id} fully completed at stage-{stage_id}")
 
     def _process_single_result(
         self,

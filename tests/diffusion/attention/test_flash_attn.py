@@ -15,9 +15,6 @@ import torch
 from vllm_omni.diffusion.attention.backends.abstract import AttentionMetadata
 from vllm_omni.diffusion.attention.backends.flash_attn import FlashAttentionImpl
 from vllm_omni.diffusion.attention.backends.sdpa import SDPAImpl
-from vllm_omni.platforms import current_omni_platform
-
-is_gpu = current_omni_platform.is_cuda_alike() or current_omni_platform.is_xpu()
 
 
 def create_attention_mask(batch_size: int, seq_len: int, valid_len: int, device: torch.device) -> torch.Tensor:
@@ -59,7 +56,7 @@ def pad_tensor(tensor: torch.Tensor, target_seq_len: int, pad_value: float = 0.0
     return torch.cat([tensor, padding], dim=1)
 
 
-@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashAttention requires CUDA")
 def test_padding_equivalence():
     """
     Case 1: Test that padded and unpadded inputs produce similar outputs.
@@ -71,7 +68,7 @@ def test_padding_equivalence():
 
     Expected: Output A and Output B should be very close.
     """
-    device = torch.device(current_omni_platform.device_type)
+    device = torch.device("cuda")
     dtype = torch.bfloat16
 
     # Configuration
@@ -152,7 +149,7 @@ def test_padding_equivalence():
     print("✓ Case 1 PASSED: Padded and unpadded outputs are very close!")
 
 
-@pytest.mark.skipif(not is_gpu, reason="FlashAttention requires CUDA or XPU")
+@pytest.mark.skipif(not torch.cuda.is_available(), reason="FlashAttention requires CUDA")
 def test_fa_vs_sdpa():
     """
     Case 2: Compare FlashAttention and SDPA backends with padding.
@@ -165,7 +162,7 @@ def test_fa_vs_sdpa():
 
     Expected: FA and SDPA outputs should be very close.
     """
-    device = torch.device(current_omni_platform.device_type)
+    device = torch.device("cuda")
     dtype = torch.bfloat16
 
     # Configuration
@@ -268,8 +265,8 @@ if __name__ == "__main__":
     print("Running FlashAttention Padding Tests...")
     print("=" * 60)
 
-    # Try to run tests
-    if is_gpu:
+    # Try to run CUDA tests
+    if torch.cuda.is_available():
         try:
             print("\n[Running Case 1: Padding Equivalence for FA]")
             test_padding_equivalence()

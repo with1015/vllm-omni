@@ -1,6 +1,6 @@
 import asyncio
 
-from vllm_omni.metrics import OrchestratorAggregator
+from vllm_omni.entrypoints.log_utils import OrchestratorMetrics
 
 
 class ClientRequestState:
@@ -10,4 +10,4 @@ class ClientRequestState:
         self.request_id = request_id
         self.stage_id: int | None = None
         self.queue = queue if queue is not None else asyncio.Queue()
-        self.metrics: OrchestratorAggregator | None = None
+        self.metrics: OrchestratorMetrics | None = None

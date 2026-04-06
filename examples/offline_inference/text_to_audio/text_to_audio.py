@@ -9,8 +9,8 @@ the Stable Audio Open model with vLLM-Omni.
 
 Usage:
     python text_to_audio.py --prompt "The sound of a dog barking"
-    python text_to_audio.py --prompt "A piano playing a gentle melody" --audio-length 10.0
-    python text_to_audio.py --prompt "Thunder and rain sounds" --negative-prompt "Low quality"
+    python text_to_audio.py --prompt "A piano playing a gentle melody" --audio_length 10.0
+    python text_to_audio.py --prompt "Thunder and rain sounds" --negative_prompt "Low quality"
 """
 
 import argparse
@@ -21,8 +21,7 @@ import numpy as np
 import torch
 
 from vllm_omni.entrypoints.omni import Omni
-from vllm_omni.inputs.data import OmniDiffusionSamplingParams
-from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.platform_utils import detect_device_type
 
 
 def parse_args() -> argparse.Namespace:
@@ -38,7 +37,7 @@ def parse_args() -> argparse.Namespace:
         help="Text prompt for audio generation.",
     )
     parser.add_argument(
-        "--negative-prompt",
+        "--negative_prompt",
         default="Low quality.",
         help="Negative prompt for classifier-free guidance.",
     )
@@ -49,31 +48,31 @@ def parse_args() -> argparse.Namespace:
         help="Random seed for deterministic results.",
     )
     parser.add_argument(
-        "--guidance-scale",
+        "--guidance_scale",
         type=float,
         default=7.0,
         help="Classifier-free guidance scale.",
     )
     parser.add_argument(
-        "--audio-start",
+        "--audio_start",
         type=float,
         default=0.0,
         help="Audio start time in seconds.",
     )
     parser.add_argument(
-        "--audio-length",
+        "--audio_length",
         type=float,
         default=10.0,
         help="Audio length in seconds (max ~47s for stable-audio-open-1.0).",
     )
     parser.add_argument(
-        "--num-inference-steps",
+        "--num_inference_steps",
         type=int,
         default=100,
         help="Number of denoising steps for the diffusion sampler.",
     )
     parser.add_argument(
-        "--num-waveforms",
+        "--num_waveforms",
         type=int,
         default=1,
         help="Number of audio waveforms to generate for the given prompt.",
@@ -85,7 +84,7 @@ def parse_args() -> argparse.Namespace:
         help="Path to save the generated audio (WAV format).",
     )
     parser.add_argument(
-        "--sample-rate",
+        "--sample_rate",
         type=int,
         default=44100,
         help="Sample rate for output audio (Stable Audio uses 44100 Hz).",
@@ -118,7 +117,8 @@ def save_audio(audio_data: np.ndarray, output_path: str, sample_rate: int = 4410
 
 def main():
     args = parse_args()
-    generator = torch.Generator(device=current_omni_platform.device_type).manual_seed(args.seed)
+    device = detect_device_type()
+    generator = torch.Generator(device=device).manual_seed(args.seed)
 
     print(f"\n{'=' * 60}")
     print("Stable Audio Open - Text-to-Audio Generation")
@@ -142,21 +142,17 @@ def main():
     generation_start = time.perf_counter()
 
     # Generate audio
-    outputs = omni.generate(
-        {
-            "prompt": args.prompt,
-            "negative_prompt": args.negative_prompt,
+    audio = omni.generate(
+        args.prompt,
+        negative_prompt=args.negative_prompt,
+        generator=generator,
+        guidance_scale=args.guidance_scale,
+        num_inference_steps=args.num_inference_steps,
+        num_outputs_per_prompt=args.num_waveforms,
+        extra={
+            "audio_start_in_s": args.audio_start,
+            "audio_end_in_s": audio_end_in_s,
         },
-        OmniDiffusionSamplingParams(
-            generator=generator,
-            guidance_scale=args.guidance_scale,
-            num_inference_steps=args.num_inference_steps,
-            num_outputs_per_prompt=args.num_waveforms,
-            extra_args={
-                "audio_start_in_s": args.audio_start,
-                "audio_end_in_s": audio_end_in_s,
-            },
-        ),
     )
 
     generation_end = time.perf_counter()
@@ -169,21 +165,6 @@ def main():
     output_path.parent.mkdir(parents=True, exist_ok=True)
     suffix = output_path.suffix or ".wav"
     stem = output_path.stem or "stable_audio_output"
-
-    # Extract audio from omni.generate() outputs
-    if not outputs:
-        raise ValueError("No output generated from omni.generate()")
-
-    output = outputs[0]
-    if not hasattr(output, "request_output") or not output.request_output:
-        raise ValueError("No request_output found in OmniRequestOutput")
-    request_output = output.request_output[0]
-    if not hasattr(request_output, "multimodal_output"):
-        raise ValueError("No multimodal_output found in request_output")
-
-    audio = request_output.multimodal_output.get("audio")
-    if audio is None:
-        raise ValueError("No audio output found in request_output")
 
     # Handle different output formats
     if isinstance(audio, torch.Tensor):

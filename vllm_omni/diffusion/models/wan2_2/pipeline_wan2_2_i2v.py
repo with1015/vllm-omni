@@ -3,10 +3,8 @@
 
 from __future__ import annotations
 
-import logging
 import os
 from collections.abc import Iterable
-from typing import Any, cast
 
 import numpy as np
 import PIL.Image
@@ -18,7 +16,6 @@ from transformers import AutoTokenizer, CLIPImageProcessor, CLIPVisionModel, UMT
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.cfg_parallel import CFGParallelMixin
 from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.models.interface import SupportImageInput
@@ -29,10 +26,6 @@ from vllm_omni.diffusion.models.wan2_2.pipeline_wan2_2 import (
     retrieve_latents,
 )
 from vllm_omni.diffusion.request import OmniDiffusionRequest
-from vllm_omni.inputs.data import OmniTextPrompt
-from vllm_omni.platforms import current_omni_platform
-
-logger = logging.getLogger(__name__)
 
 
 def _load_model_index(model: str, local_files_only: bool) -> dict:
@@ -84,61 +77,44 @@ def get_wan22_i2v_pre_process_func(
 
     video_processor = VideoProcessor(vae_scale_factor=8)
 
-    def pre_process_func(request: OmniDiffusionRequest) -> OmniDiffusionRequest:
-        for i, prompt in enumerate(request.prompts):
-            multi_modal_data = prompt.get("multi_modal_data", {}) if not isinstance(prompt, str) else None
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if isinstance(prompt, str):
-                prompt = OmniTextPrompt(prompt=prompt)
-            if "additional_information" not in prompt:
-                prompt["additional_information"] = {}
+    def pre_process_func(requests: list[OmniDiffusionRequest]) -> list[OmniDiffusionRequest]:
+        for req in requests:
+            # Load image if path is provided
+            if req.image_path is not None and req.pil_image is None:
+                req.pil_image = PIL.Image.open(req.image_path).convert("RGB")
 
-            if raw_image is None:
-                raise ValueError(
-                    """No image is provided. This model requires an image to run.""",
-                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
-                )
-            if not isinstance(raw_image, (str, PIL.Image.Image)):
-                raise TypeError(
-                    f"""Unsupported image format {raw_image.__class__}.""",
-                    """Please correctly set `"multi_modal_data": {"image": <an image object or file path>, …}`""",
-                )
-            image = PIL.Image.open(raw_image).convert("RGB") if isinstance(raw_image, str) else raw_image
+            if req.pil_image is not None:
+                image = req.pil_image
 
-            # Calculate dimensions based on aspect ratio if not provided
-            if request.sampling_params.height is None or request.sampling_params.width is None:
-                # Default max area for 480P
-                max_area = 480 * 832
-                aspect_ratio = image.height / image.width
+                # Calculate dimensions based on aspect ratio if not provided
+                if req.height is None or req.width is None:
+                    # Default max area for 480P
+                    max_area = 480 * 832
+                    aspect_ratio = image.height / image.width
 
-                # Calculate dimensions maintaining aspect ratio
-                mod_value = 16  # Must be divisible by 16
-                height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
-                width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
+                    # Calculate dimensions maintaining aspect ratio
+                    mod_value = 16  # Must be divisible by 16
+                    height = round(np.sqrt(max_area * aspect_ratio)) // mod_value * mod_value
+                    width = round(np.sqrt(max_area / aspect_ratio)) // mod_value * mod_value
 
-                if request.sampling_params.height is None:
-                    request.sampling_params.height = height
-                if request.sampling_params.width is None:
-                    request.sampling_params.width = width
+                    if req.height is None:
+                        req.height = height
+                    if req.width is None:
+                        req.width = width
 
-            # Resize image to target dimensions
-            image = image.resize(
-                (request.sampling_params.width, request.sampling_params.height),  # type: ignore # Above has ensured that width & height are not None
-                PIL.Image.Resampling.LANCZOS,
-            )
-            prompt["multi_modal_data"]["image"] = image  # type: ignore # key existence already checked above
+                # Resize image to target dimensions
+                image = image.resize((req.width, req.height), PIL.Image.Resampling.LANCZOS)
+                req.pil_image = image
 
-            # Preprocess for VAE
-            prompt["additional_information"]["preprocessed_image"] = video_processor.preprocess(
-                image, height=request.sampling_params.height, width=request.sampling_params.width
-            )
-            request.prompts[i] = prompt
-        return request
+                # Preprocess for VAE
+                req.preprocessed_image = video_processor.preprocess(image, height=req.height, width=req.width)
+
+        return requests
 
     return pre_process_func
 
 
-class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
+class Wan22I2VPipeline(nn.Module, SupportImageInput):
     """
     Wan2.2 Image-to-Video Pipeline.
 
@@ -278,19 +254,20 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         image_embeds = self.image_encoder(pixel_values, output_hidden_states=True)
         return image_embeds.hidden_states[-2]
 
+    @torch.no_grad()
     def forward(
         self,
         req: OmniDiffusionRequest,
         prompt: str | None = None,
         negative_prompt: str | None = None,
         image: PIL.Image.Image | torch.Tensor | None = None,
-        height: int = 480,
-        width: int = 832,
-        num_inference_steps: int = 40,
+        height: int | None = None,
+        width: int | None = None,
+        num_inference_steps: int | None = None,
         guidance_scale: float | tuple[float, float] = 5.0,
-        frame_num: int = 81,
+        frame_num: int | None = None,
         output_type: str | None = "np",
-        generator: torch.Generator | list[torch.Generator] | None = None,
+        generator: torch.Generator | None = None,
         prompt_embeds: torch.Tensor | None = None,
         negative_prompt_embeds: torch.Tensor | None = None,
         image_embeds: torch.Tensor | None = None,
@@ -299,51 +276,27 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         **kwargs,
     ) -> DiffusionOutput:
         # Get parameters from request or arguments
-        if len(req.prompts) > 1:
-            raise ValueError(
-                """This model only supports a single prompt, not a batched request.""",
-                """Please pass in a single prompt object or string, or a single-item list.""",
-            )
-        if len(req.prompts) == 1:  # If req.prompt is empty, default to prompt & neg_prompt in param list
-            prompt = req.prompts[0] if isinstance(req.prompts[0], str) else req.prompts[0].get("prompt")
-            negative_prompt = None if isinstance(req.prompts[0], str) else req.prompts[0].get("negative_prompt")
+        prompt = req.prompt if req.prompt is not None else prompt
+        negative_prompt = req.negative_prompt if req.negative_prompt is not None else negative_prompt
         if prompt is None and prompt_embeds is None:
-            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 generation.")
+            raise ValueError("Prompt or prompt_embeds is required for Wan2.2 I2V generation.")
 
         # Get image from request
         if image is None:
-            multi_modal_data = (
-                req.prompts[0].get("multi_modal_data", {}) if not isinstance(req.prompts[0], str) else None
-            )
-            raw_image = multi_modal_data.get("image", None) if multi_modal_data is not None else None
-            if raw_image is None:
-                raise ValueError("Image is required for I2V generation.")
-            if isinstance(raw_image, list):
-                if len(raw_image) > 1:
-                    logger.warning(
-                        """Received a list of image. Only a single image is supported by this model."""
-                        """Taking only the first image for now."""
-                    )
-                raw_image = raw_image[0]
-            if isinstance(raw_image, str):
-                image = PIL.Image.open(raw_image)
-            else:
-                image = cast(PIL.Image.Image | torch.Tensor, raw_image)
+            image = req.pil_image
+        if image is None:
+            raise ValueError("Image is required for I2V generation.")
 
-        height = req.sampling_params.height or height
-        width = req.sampling_params.width or width
-        num_frames = req.sampling_params.num_frames or frame_num
-        num_steps = req.sampling_params.num_inference_steps or num_inference_steps
-
-        # Respect per-request guidance_scale when explicitly provided.
-        if req.sampling_params.guidance_scale_provided:
-            guidance_scale = req.sampling_params.guidance_scale
+        height = req.height or height or 480
+        width = req.width or width or 832
+        num_frames = req.num_frames if req.num_frames else frame_num or 81
+        num_steps = req.num_inference_steps or num_inference_steps or 50
 
         # Handle guidance scales
         guidance_low = guidance_scale if isinstance(guidance_scale, (int, float)) else guidance_scale[0]
         guidance_high = (
-            req.sampling_params.guidance_scale_2
-            if req.sampling_params.guidance_scale_2 is not None
+            req.guidance_scale_2
+            if req.guidance_scale_2 is not None
             else (
                 guidance_scale[1]
                 if isinstance(guidance_scale, (list, tuple)) and len(guidance_scale) > 1
@@ -353,11 +306,6 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
 
         self._guidance_scale = guidance_low
         self._guidance_scale_2 = guidance_high
-
-        boundary_ratio = self.boundary_ratio if self.boundary_ratio is not None else req.sampling_params.boundary_ratio
-        if boundary_ratio is None:
-            boundary_ratio = 0.875
-            logger.warning("boundary_ratio is required for I2V generation. using default value 0.875")
 
         # Validate inputs
         self.check_inputs(
@@ -369,8 +317,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             prompt_embeds=prompt_embeds,
             negative_prompt_embeds=negative_prompt_embeds,
             image_embeds=image_embeds,
-            guidance_scale_2=guidance_high if boundary_ratio is not None else None,
-            boundary_ratio=boundary_ratio,
+            guidance_scale_2=guidance_high if self.boundary_ratio is not None else None,
         )
 
         # Adjust num_frames to be compatible with VAE temporal scaling
@@ -383,9 +330,9 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
 
         # Generator setup
         if generator is None:
-            generator = req.sampling_params.generator
-        if generator is None and req.sampling_params.seed is not None:
-            generator = torch.Generator(device=device).manual_seed(req.sampling_params.seed)
+            generator = req.generator
+        if generator is None and req.seed is not None:
+            generator = torch.Generator(device=device).manual_seed(req.seed)
 
         # Encode prompts
         if prompt_embeds is None:
@@ -393,8 +340,8 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
                 prompt=prompt,
                 negative_prompt=negative_prompt,
                 do_classifier_free_guidance=guidance_low > 1.0 or guidance_high > 1.0,
-                num_videos_per_prompt=req.sampling_params.num_outputs_per_prompt or 1,
-                max_sequence_length=req.sampling_params.max_sequence_length or 512,
+                num_videos_per_prompt=req.num_outputs_per_prompt or 1,
+                max_sequence_length=req.max_sequence_length or 512,
                 device=device,
                 dtype=dtype,
             )
@@ -423,8 +370,8 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         self._num_timesteps = len(timesteps)
 
         boundary_timestep = None
-        if boundary_ratio is not None:
-            boundary_timestep = boundary_ratio * self.scheduler.config.num_train_timesteps
+        if self.boundary_ratio is not None:
+            boundary_timestep = self.boundary_ratio * self.scheduler.config.num_train_timesteps
 
         # Prepare latents (use out_channels=16 for VAE latent, not in_channels=36)
         num_channels_latents = self.transformer.config.out_channels
@@ -460,7 +407,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             dtype=torch.float32,
             device=device,
             generator=generator,
-            latents=req.sampling_params.latents,
+            latents=req.latents,
             last_image=last_image_tensor,
         )
 
@@ -492,46 +439,31 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
                 latent_model_input = torch.cat([latents, condition], dim=1).to(dtype)
                 timestep = t.expand(latents.shape[0])
 
-            do_true_cfg = current_guidance_scale > 1.0 and negative_prompt_embeds is not None
-            # Prepare kwargs for positive and negative predictions
-            positive_kwargs = {
-                "hidden_states": latent_model_input,
-                "timestep": timestep,
-                "encoder_hidden_states": prompt_embeds,
-                "encoder_hidden_states_image": image_embeds,
-                "attention_kwargs": attention_kwargs,
-                "return_dict": False,
-                "current_model": current_model,
-            }
-            if do_true_cfg:
-                negative_kwargs = {
-                    "hidden_states": latent_model_input,
-                    "timestep": timestep,
-                    "encoder_hidden_states": negative_prompt_embeds,
-                    "encoder_hidden_states_image": image_embeds,
-                    "attention_kwargs": attention_kwargs,
-                    "return_dict": False,
-                    "current_model": current_model,
-                }
-            else:
-                negative_kwargs = None
+            # Forward pass
+            noise_pred = current_model(
+                hidden_states=latent_model_input,
+                timestep=timestep,
+                encoder_hidden_states=prompt_embeds,
+                encoder_hidden_states_image=image_embeds,
+                attention_kwargs=attention_kwargs,
+                return_dict=False,
+            )[0]
 
-            # Predict noise with automatic CFG parallel handling
-            noise_pred = self.predict_noise_maybe_with_cfg(
-                do_true_cfg=do_true_cfg,
-                true_cfg_scale=current_guidance_scale,
-                positive_kwargs=positive_kwargs,
-                negative_kwargs=negative_kwargs,
-                cfg_normalize=False,
-            )
+            # Classifier-free guidance
+            if current_guidance_scale > 1.0 and negative_prompt_embeds is not None:
+                noise_uncond = current_model(
+                    hidden_states=latent_model_input,
+                    timestep=timestep,
+                    encoder_hidden_states=negative_prompt_embeds,
+                    encoder_hidden_states_image=image_embeds,
+                    attention_kwargs=attention_kwargs,
+                    return_dict=False,
+                )[0]
+                noise_pred = noise_uncond + current_guidance_scale * (noise_pred - noise_uncond)
 
-            # Compute the previous noisy sample x_t -> x_t-1 with automatic CFG sync
-            latents = self.scheduler_step_maybe_with_cfg(noise_pred, t, latents, do_true_cfg)
+            # Scheduler step
+            latents = self.scheduler.step(noise_pred, t, latents, return_dict=False)[0]
 
-        # Wan2.2 is prone to out of memory errors when predicting large videos
-        # so we empty the cache here to avoid OOM before vae decoding.
-        if current_omni_platform.is_available():
-            current_omni_platform.empty_cache()
         self._current_timestep = None
 
         # For expand_timesteps mode, blend final latents with condition
@@ -555,21 +487,6 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
             output = self.vae.decode(latents, return_dict=False)[0]
 
         return DiffusionOutput(output=output)
-
-    def predict_noise(self, current_model: nn.Module | None = None, **kwargs: Any) -> torch.Tensor:
-        """
-        Forward pass through transformer to predict noise.
-
-        Args:
-            current_model: The transformer model to use (transformer or transformer_2)
-            **kwargs: Arguments to pass to the transformer
-
-        Returns:
-            Predicted noise tensor
-        """
-        if current_model is None:
-            current_model = self.transformer
-        return current_model(**kwargs)[0]
 
     def encode_prompt(
         self,
@@ -758,7 +675,6 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         negative_prompt_embeds=None,
         image_embeds=None,
         guidance_scale_2=None,
-        boundary_ratio=None,
     ):
         if image is None and image_embeds is None:
             raise ValueError("Provide either `image` or `image_embeds`. Cannot leave both undefined.")
@@ -780,7 +696,7 @@ class Wan22I2VPipeline(nn.Module, SupportImageInput, CFGParallelMixin):
         if prompt is None and prompt_embeds is None:
             raise ValueError("Provide either `prompt` or `prompt_embeds`.")
 
-        if boundary_ratio is None and guidance_scale_2 is not None:
+        if self.boundary_ratio is None and guidance_scale_2 is not None:
             raise ValueError("`guidance_scale_2` is only supported when `boundary_ratio` is set.")
 
     def load_weights(self, weights: Iterable[tuple[str, torch.Tensor]]) -> set[str]:

@@ -5,10 +5,11 @@ import os
 
 import torch
 
-from vllm_omni.platforms import current_omni_platform
+from vllm_omni.utils.platform_utils import detect_device_type
 
 
 def get_local_device() -> torch.device:
     """Return the torch device for the current rank based on detected device type."""
-    local_rank = int(os.environ.get("LOCAL_RANK", 0))
-    return current_omni_platform.get_torch_device(local_rank)
+    device_type = detect_device_type()
+    local_rank = os.environ.get("LOCAL_RANK", 0)
+    return torch.device(f"{device_type}:{local_rank}")

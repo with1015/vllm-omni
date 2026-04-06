@@ -116,9 +116,6 @@ if [[ $commands == *"--shard-id="* ]]; then
         --shm-size=16gb \
         --group-add "$render_gid" \
         --rm \
-        -e MIOPEN_DEBUG_CONV_DIRECT=0 \
-        -e MIOPEN_DEBUG_CONV_GEMM=0 \
-        -e VLLM_ROCM_USE_AITER=1 \
         -e HIP_VISIBLE_DEVICES="${GPU}" \
         -e HF_TOKEN \
         -e AWS_ACCESS_KEY_ID \
@@ -151,9 +148,6 @@ else
           --shm-size=16gb \
           --group-add "$render_gid" \
           --rm \
-          -e MIOPEN_DEBUG_CONV_DIRECT=0 \
-          -e MIOPEN_DEBUG_CONV_GEMM=0 \
-          -e VLLM_ROCM_USE_AITER=1 \
           -e HF_TOKEN \
           -e AWS_ACCESS_KEY_ID \
           -e AWS_SECRET_ACCESS_KEY \
