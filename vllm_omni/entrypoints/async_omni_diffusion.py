@@ -10,21 +10,42 @@ enabling concurrent request handling and streaming generation.
 
 import asyncio
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
-from dataclasses import fields
 from typing import Any
 
-from PIL import Image
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
+try:
+    from huggingface_hub.errors import HFValidationError as _HFValidationError
+except ImportError:
+    _HFValidationError = ValueError
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
+from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
+from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _weak_close_async_omni_diffusion(engine: DiffusionEngine, executor: ThreadPoolExecutor) -> None:
+    """Best-effort diffusion cleanup for GC finalization."""
+    try:
+        engine.close()
+    except Exception:
+        pass
+    try:
+        executor.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 class AsyncOmniDiffusion:
@@ -53,25 +74,81 @@ class AsyncOmniDiffusion:
         self,
         model: str,
         od_config: OmniDiffusionConfig | None = None,
+        batch_size: int = 1,
         **kwargs: Any,
     ):
         self.model = model
+
+        # Set batch size (default 1 for backward compatibility)
+        self._batch_size = max(1, batch_size)
+
+        # Capture stage info from kwargs before they might be filtered out
+        stage_id = kwargs.get("stage_id")
+        engine_input_source = kwargs.get("engine_input_source")
+        cfg_kv_collect_func = kwargs.pop("cfg_kv_collect_func", None)
 
         # Build config
         if od_config is None:
             od_config = OmniDiffusionConfig.from_kwargs(model=model, **kwargs)
         elif isinstance(od_config, dict):
+            # If config is dict, check it too (priority to kwargs if both exist)
+            if stage_id is None:
+                stage_id = od_config.get("stage_id")
+            if engine_input_source is None:
+                engine_input_source = od_config.get("engine_input_source")
             od_config = OmniDiffusionConfig.from_kwargs(**od_config)
 
         self.od_config = od_config
 
-        # Load model class name and transformer config
-        config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
-        od_config.model_class_name = config_dict.get("_class_name", None)
-        od_config.update_multimodal_support()
+        # Inject stage info into omni_kv_config if present
+        if stage_id is not None:
+            self.od_config.omni_kv_config.setdefault("stage_id", stage_id)
+        if engine_input_source is not None:
+            self.od_config.omni_kv_config.setdefault("engine_input_source", engine_input_source)
 
-        tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
-        od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+        # Diffusers-style models expose `model_index.json` with `_class_name`.
+        # Non-diffusers models (e.g. Bagel, NextStep) only have `config.json`,
+        # so we fall back to reading that and mapping model_type manually.
+        try:
+            config_dict = get_hf_file_to_dict("model_index.json", od_config.model)
+            if config_dict is not None:
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = config_dict.get("_class_name", None)
+                od_config.update_multimodal_support()
+
+                tf_config_dict = get_hf_file_to_dict("transformer/config.json", od_config.model)
+                od_config.tf_model_config = TransformerConfig.from_dict(tf_config_dict)
+            else:
+                raise FileNotFoundError("model_index.json not found")
+        except (AttributeError, KeyError, OSError, ValueError, FileNotFoundError, _HFValidationError):
+            cfg = get_hf_file_to_dict("config.json", od_config.model)
+            if cfg is None:
+                if od_config.model_class_name is not None:
+                    cfg = {}  # skip - use explicit model_class_name
+                else:
+                    raise ValueError(f"Could not find config.json or model_index.json for model {od_config.model}")
+
+            od_config.tf_model_config = TransformerConfig.from_dict(cfg)
+            model_type = cfg.get("model_type")
+            architectures = cfg.get("architectures") or []
+            # Bagel/NextStep models don't have a model_index.json, so we set the pipeline class name manually
+            if model_type == "bagel" or "BagelForConditionalGeneration" in architectures:
+                od_config.model_class_name = "BagelPipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
+            elif model_type == "nextstep":
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = "NextStep11Pipeline"
+                od_config.tf_model_config = TransformerConfig()
+                od_config.update_multimodal_support()
+            elif architectures and len(architectures) == 1:
+                if od_config.model_class_name is None:
+                    od_config.model_class_name = architectures[0]
+            elif od_config.model_class_name is None:
+                raise
+
+        if cfg_kv_collect_func is not None:
+            od_config.cfg_kv_collect_func = cfg_kv_collect_func
 
         # Initialize engine
         self.engine: DiffusionEngine = DiffusionEngine.make_engine(od_config)
@@ -79,67 +156,139 @@ class AsyncOmniDiffusion:
         # Thread pool for running sync engine in async context
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_async_omni_diffusion,
+            self.engine,
+            self._executor,
+        )
 
-        logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+        logger.info("AsyncOmniDiffusion initialized with model: %s, batch_size: %d", model, self._batch_size)
 
-    def _prepare_request(
+    # ------------------------------------------------------------------
+    # batch_size property
+    # ------------------------------------------------------------------
+
+    @property
+    def batch_size(self) -> int:
+        """Return the configured batch size for request batching."""
+        return self._batch_size
+
+    @batch_size.setter
+    def batch_size(self, value: int) -> None:
+        if not isinstance(value, int) or value < 1:
+            raise ValueError("batch_size must be a positive integer")
+        self._batch_size = value
+
+    # ------------------------------------------------------------------
+    # Public batch generation API
+    # ------------------------------------------------------------------
+
+    async def generate_batch(
         self,
-        prompt: str,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
-        **kwargs: Any,
-    ) -> OmniDiffusionRequest:
-        """Prepare a diffusion request from prompt and parameters.
+        lora_request: LoRARequest | None = None,
+    ) -> OmniRequestOutput:
+        """Generate images from multiple prompts in a single engine call.
+
+        Batches the given prompts into **one** ``DiffusionEngine.step()``
+        call and returns a single ``OmniRequestOutput`` containing all
+        generated images.  Called by ``StageDiffusionClient._run_batch``
+        when the orchestrator receives a list-prompt request.
 
         Args:
-            prompt: Text prompt for image generation
-            request_id: Optional unique identifier for the request
-            **kwargs: Additional generation parameters
+            prompts: List of text prompts describing the desired images.
+            sampling_params: Shared sampling parameters for all prompts.
+            request_id: Optional unique identifier. Auto-generated when *None*.
+            lora_request: Optional LoRA adapter to apply.
 
         Returns:
-            OmniDiffusionRequest ready for processing
+            A single ``OmniRequestOutput`` with all images combined.
         """
         if request_id is None:
-            request_id = f"diff-{uuid.uuid4().hex[:16]}"
+            request_id = f"diff-batch-{uuid.uuid4().hex[:8]}"
+        return await self._generate_batch(prompts, sampling_params, request_id, lora_request)
 
-        field_names = {f.name for f in fields(OmniDiffusionRequest)}
+    # ------------------------------------------------------------------
+    # Internal batch generation
+    # ------------------------------------------------------------------
 
-        init_kwargs = {
-            "prompt": prompt,
-            "request_id": request_id,
-        }
+    async def _generate_batch(
+        self,
+        prompts: list[OmniPromptType],
+        sampling_params: OmniDiffusionSamplingParams,
+        request_id: str,
+        lora_request: LoRARequest | None = None,
+    ) -> OmniRequestOutput:
+        """Generate images from multiple prompts in a single engine call."""
+        if not prompts:
+            return OmniRequestOutput(request_id=request_id, images=[], final_output_type="image")
 
-        for key, value in kwargs.items():
-            if key in field_names:
-                init_kwargs[key] = value
+        if sampling_params.guidance_scale:
+            sampling_params.guidance_scale_provided = True
 
-        return OmniDiffusionRequest(**init_kwargs)
+        if lora_request is not None:
+            sampling_params.lora_request = lora_request
+
+        request = OmniDiffusionRequest(
+            prompts=prompts,
+            sampling_params=sampling_params,
+            request_ids=[f"{request_id}-{i}" for i in range(len(prompts))],
+        )
+
+        logger.debug("Starting batch generation for %d prompts, request_id=%s", len(prompts), request_id)
+
+        loop = asyncio.get_event_loop()
+        try:
+            results = await loop.run_in_executor(
+                self._executor,
+                self.engine.step,
+                request,
+            )
+        except Exception as e:
+            logger.error("Batch generation failed for request %s: %s", request_id, e)
+            raise RuntimeError(f"Diffusion batch generation failed: {e}") from e
+
+        # Combine all per-prompt results into a single OmniRequestOutput
+        all_images = []
+        for result in results:
+            all_images.extend(result.images)
+
+        return OmniRequestOutput(
+            request_id=request_id,
+            images=all_images,
+            final_output_type="image",
+            finished=True,
+        )
+
+    def get_diffusion_od_config(self) -> OmniDiffusionConfig:
+        """Return the diffusion config used by this engine."""
+        return self.od_config
+
+    # ------------------------------------------------------------------
+    # Public generate API
+    # ------------------------------------------------------------------
 
     async def generate(
         self,
-        prompt: str,
+        prompt: OmniPromptType,
+        sampling_params: OmniDiffusionSamplingParams,
         request_id: str | None = None,
-        num_inference_steps: int = 50,
-        guidance_scale: float | None = None,
-        height: int | None = None,
-        width: int | None = None,
-        negative_prompt: str | None = None,
-        num_outputs_per_prompt: int = 1,
-        seed: int | None = None,
-        **kwargs: Any,
+        lora_request: LoRARequest | None = None,
     ) -> OmniRequestOutput:
-        """Generate images asynchronously from a text prompt.
+        """Generate images asynchronously from a single text prompt.
+
+        For batched generation (multiple prompts in one engine call), use
+        :meth:`generate_batch` instead.  This method always processes
+        exactly one prompt per call.
 
         Args:
             prompt: Text prompt describing the desired image
+            sampling_params: Sampling parameters
             request_id: Optional unique identifier for tracking the request
-            num_inference_steps: Number of denoising steps (default: 50)
-            guidance_scale: Classifier-free guidance scale (optional, uses model defaults if omitted)
-            height: Optional image height in pixels
-            width: Optional image width in pixels
-            negative_prompt: Optional negative prompt for guidance
-            num_outputs_per_prompt: Number of images to generate (default: 1)
-            seed: Optional random seed for reproducibility
-            **kwargs: Additional generation parameters
+            lora_request: Optional LoRA adapter to apply
 
         Returns:
             OmniRequestOutput containing generated images
@@ -149,64 +298,49 @@ class AsyncOmniDiffusion:
         """
         if request_id is None:
             request_id = f"diff-{uuid.uuid4().hex[:16]}"
+        if sampling_params.guidance_scale:
+            sampling_params.guidance_scale_provided = True
 
-        # Prepare request
-        request_kwargs = {
-            "prompt": prompt,
-            "request_id": request_id,
-            "num_inference_steps": num_inference_steps,
-            "height": height,
-            "width": width,
-            "negative_prompt": negative_prompt,
-            "num_outputs_per_prompt": num_outputs_per_prompt,
-            "seed": seed,
-            **kwargs,
-        }
-        if guidance_scale is not None:
-            request_kwargs["guidance_scale"] = guidance_scale
+        if lora_request is not None:
+            sampling_params.lora_request = lora_request
 
-        request = self._prepare_request(**request_kwargs)
+        # Extract additional_information from OmniTokensPrompt into extra dict
+        # (carries audio_tokens, vision_tokens, etc. from thinker2*_decoder processors)
+        extra: dict = {}
+        if isinstance(prompt, dict) and prompt.get('additional_information'):
+            extra.update(prompt['additional_information'])
+        elif hasattr(prompt, 'additional_information') and prompt.additional_information:
+            extra.update(prompt.additional_information)
+
+        request = OmniDiffusionRequest(
+            prompts=[prompt],
+            sampling_params=sampling_params,
+            request_ids=[request_id],
+            extra=extra if extra else {},
+        )
 
         logger.debug("Starting generation for request %s", request_id)
 
-        # Run engine in thread pool
         loop = asyncio.get_event_loop()
         try:
             result = await loop.run_in_executor(
                 self._executor,
                 self.engine.step,
-                [request],
+                request,
             )
+            result = result[0]
+        except asyncio.CancelledError:
+            self.engine.abort(request_id)
+            raise
+        except DiffusionRequestAbortedError:
+            raise
         except Exception as e:
             logger.error("Generation failed for request %s: %s", request_id, e)
             raise RuntimeError(f"Diffusion generation failed: {e}") from e
 
-        # Check if result is already OmniRequestOutput
-        if isinstance(result, OmniRequestOutput):
-            # Update request_id if needed
-            if not result.request_id:
-                result.request_id = request_id
-            return result
-
-        # Process results if not OmniRequestOutput
-        images: list[Image.Image] = []
-        if result is not None:
-            if isinstance(result, list):
-                for item in result:
-                    if isinstance(item, Image.Image):
-                        images.append(item)
-            elif isinstance(result, Image.Image):
-                images.append(result)
-
-        return OmniRequestOutput.from_diffusion(
-            request_id=request_id,
-            images=images,
-            prompt=prompt,
-            metrics={
-                "num_inference_steps": num_inference_steps,
-                "guidance_scale": request.guidance_scale,
-            },
-        )
+        if not result.request_id:
+            result.request_id = request_id
+        return result
 
     async def generate_stream(
         self,
@@ -240,6 +374,10 @@ class AsyncOmniDiffusion:
             return
         self._closed = True
 
+        finalizer = getattr(self, "_weak_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
+
         try:
             self.engine.close()
         except Exception as e:
@@ -256,13 +394,6 @@ class AsyncOmniDiffusion:
         """Alias for close() method."""
         self.close()
 
-    def __del__(self) -> None:
-        """Best-effort cleanup on deletion."""
-        try:
-            self.close()
-        except Exception:
-            pass
-
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request."""
         self.engine.abort(request_id)
@@ -276,3 +407,84 @@ class AsyncOmniDiffusion:
     def is_stopped(self) -> bool:
         """Check if the engine is stopped."""
         return self._closed
+
+    async def remove_lora(self, adapter_id: int) -> bool:
+        """Remove a LoRA"""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "remove_lora",
+            None,
+            (adapter_id,),
+            {},
+            None,
+        )
+        return all(results) if isinstance(results, list) else results
+
+    async def add_lora(self, lora_request: LoRARequest) -> bool:
+        """Add a LoRA adapter"""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "add_lora",
+            None,
+            (),
+            {"lora_request": lora_request},
+            None,
+        )
+        return all(results) if isinstance(results, list) else results
+
+    async def list_loras(self) -> list[int]:
+        """List all registered LoRA adapter IDs."""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "list_loras",
+            None,
+            (),
+            {},
+            None,
+        )
+        # collective_rpc returns list from workers; flatten unique ids
+        if not isinstance(results, list):
+            return results or []
+        merged: set[int] = set()
+        for part in results:
+            merged.update(part or [])
+        return sorted(merged)
+
+    async def pin_lora(self, lora_id: int) -> bool:
+        """Prevent an adapter from being evicted."""
+        loop = asyncio.get_event_loop()
+        results = await loop.run_in_executor(
+            self._executor,
+            self.engine.collective_rpc,
+            "pin_lora",
+            None,
+            (),
+            {"adapter_id": lora_id},
+            None,
+        )
+        return all(results) if isinstance(results, list) else results
+
+    async def profile(self, is_start: bool = True, profile_prefix: str | None = None) -> None:
+        """Start or stop profiling for the diffusion model.
+
+        Args:
+            is_start: True to start profiling, False to stop.
+            profile_prefix: Optional prefix for trace filename (vLLM compat).
+
+        Note:
+            Matches vLLM's worker.profile() signature for consistency.
+            Traces are saved automatically via on_trace_ready callback.
+        """
+        loop = asyncio.get_event_loop()
+        await loop.run_in_executor(
+            self._executor,
+            self.engine.profile,
+            is_start,
+            profile_prefix,
+        )

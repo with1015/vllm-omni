@@ -10,7 +10,7 @@ from vllm_omni.diffusion.models.hyperclovax_audio.pipeline_hyperclovax_audio imp
 )
 
 __all__ = [
-    "HyperCLOVAXAudioPipeline",
     "HyperCLOVAXAudioDecoderModel",
+    "HyperCLOVAXAudioPipeline",
     "get_hyperclovax_audio_post_process_func",
 ]

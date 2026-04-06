@@ -43,6 +43,7 @@ def main():
             for cmd in new_cmds:
                 cmd.subparser_init(subparsers).set_defaults(dispatch_function=cmd.cmd)
                 cmds[cmd.name] = cmd
+        sys.argv = [a for a in sys.argv if a != "--omni"]
         args = parser.parse_args()
         if args.subparser in cmds:
             cmds[args.subparser].validate(args)
