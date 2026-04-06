@@ -1,6 +1,4 @@
-import time
-from collections.abc import Mapping
-from typing import Any, cast
+"""OmniInputProcessor: extends vLLM InputProcessor with OmniInputPreprocessor."""
 
 import numpy as np
 import torch
@@ -31,59 +29,17 @@ from vllm.utils import length_from_prompt_token_ids_or_embeds
 from vllm.utils.torch_utils import set_default_torch_num_threads
 from vllm.v1.engine.input_processor import InputProcessor
 
-from vllm_omni.engine import (
-    AdditionalInformationEntry,
-    AdditionalInformationPayload,
-    OmniEngineCoreRequest,
-    PromptEmbedsPayload,
-)
 from vllm_omni.inputs.preprocess import OmniInputPreprocessor
 from vllm_omni.lora.request import LoRARequest
 
-logger = init_logger(__name__)
-
 
 class OmniInputProcessor(InputProcessor):
-    """Processor for omni models, handling multimodal inputs and embeddings.
-
-    Extends the base vLLM Processor with support for processing prompt
-    embeddings and additional information payloads, enabling direct transfer
-    of pre-computed embeddings between pipeline stages.
+    """InputProcessor for omni models.
 
     Args:
         vllm_config: Global vLLM configuration
         mm_registry: Multi-modal registry for processing multimodal inputs
     """
-
-    @staticmethod
-    def _dtype_to_name(dtype: torch.dtype) -> str:
-        """Convert torch dtype to string representation.
-
-        Args:
-            dtype: PyTorch dtype to convert
-
-        Returns:
-            String representation of the dtype (e.g., "float32", "int64")
-        """
-        mapping = {
-            torch.float32: "float32",
-            torch.float: "float32",
-            torch.float16: "float16",
-            torch.half: "float16",
-            torch.bfloat16: "bfloat16",
-            torch.float64: "float64",
-            torch.double: "float64",
-            torch.int64: "int64",
-            torch.long: "int64",
-            torch.int32: "int32",
-            torch.int: "int32",
-            torch.int16: "int16",
-            torch.short: "int16",
-            torch.int8: "int8",
-            torch.uint8: "uint8",
-            torch.bool: "bool",
-        }
-        return mapping.get(dtype, str(dtype).replace("torch.", ""))
 
     def __init__(
         self,

@@ -203,6 +203,11 @@ class OmniEngineArgs(EngineArgs):
 
         return omni_config
 
+    @property
+    def output_modality(self) -> OutputModality:
+        """Parse engine_output_type into a type-safe OutputModality flag."""
+        return OutputModality.from_string(self.engine_output_type)
+
 
 @dataclass
 class AsyncOmniEngineArgs(AsyncEngineArgs):

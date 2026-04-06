@@ -90,6 +90,13 @@ class HyperCLOVAXVisionPipeline(nn.Module):
         prefix: Prefix for weight loading (default: "")
     """
 
+    @staticmethod
+    def get_dummy_extra() -> dict:
+        """Return dummy extra dict for warmup dummy run."""
+        import numpy as np
+        # token_length=729, vocab_size=65536 per token_embedder/config.json
+        return {"vision_tokens": np.zeros((1, 729), dtype=np.int64)}
+
     def __init__(
         self,
         *,

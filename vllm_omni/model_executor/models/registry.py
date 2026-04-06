@@ -48,6 +48,36 @@ _OMNI_MODELS = {
         "qwen3_omni_code2wav",
         "Qwen3OmniMoeCode2Wav",
     ),
+    "CosyVoice3Model": (
+        "cosyvoice3",
+        "cosyvoice3",
+        "CosyVoice3Model",
+    ),
+    "MammothModa2Qwen2ForCausalLM": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2Qwen2ForCausalLM",
+    ),
+    "MammothModa2ARForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ARForConditionalGeneration",
+    ),
+    "MammothModa2DiTPipeline": (
+        "mammoth_moda2",
+        "pipeline_mammothmoda2_dit",
+        "MammothModa2DiTPipeline",
+    ),
+    "MammothModa2ForConditionalGeneration": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
+    "Mammothmoda2Model": (
+        "mammoth_moda2",
+        "mammoth_moda2",
+        "MammothModa2ForConditionalGeneration",
+    ),
     "Qwen3TTSForConditionalGeneration": (
         "qwen3_tts",
         "qwen3_tts_talker",
@@ -85,11 +115,50 @@ _OMNI_MODELS = {
         "glm_image_ar",
         "GlmImageForConditionalGeneration",
     ),
-    ## HyperCLOVAX-SEED-Think-32B
-    "HyperCLOVAXOmniForCausalLM": (
-        "hyperclovax_omni",
-        "hyperclovax_omni",
-        "HyperCLOVAXOmniForCausalLM",
+    "OmniBagelForConditionalGeneration": (
+        "bagel",
+        "bagel",
+        "OmniBagelForConditionalGeneration",
+    ),
+    "HunyuanImage3ForCausalMM": (
+        "hunyuan_image3",
+        "hunyuan_image3",
+        "HunyuanImage3ForConditionalGeneration",
+    ),
+    ## fish_speech (Fish Speech S2 Pro)
+    "FishSpeechSlowARForConditionalGeneration": (
+        "fish_speech",
+        "fish_speech_slow_ar",
+        "FishSpeechSlowARForConditionalGeneration",
+    ),
+    "FishSpeechDACDecoder": (
+        "fish_speech",
+        "fish_speech_dac_decoder",
+        "FishSpeechDACDecoder",
+    ),
+    ## Voxtral TTS
+    "VoxtralTTSForConditionalGeneration": (
+        "voxtral_tts",
+        "voxtral_tts",
+        "VoxtralTTSForConditionalGeneration",
+    ),
+    "VoxtralTTSAudioGeneration": (
+        "voxtral_tts",
+        "voxtral_tts_audio_generation",
+        "VoxtralTTSAudioGenerationForConditionalGeneration",
+    ),
+    "VoxtralTTSAudioTokenizer": ("voxtral_tts", "voxtral_tts_audio_tokenizer", "VoxtralTTSAudioTokenizer"),
+    ## HyperCLOVAX-SEED-Omni-8B
+    # stage 0 (thinker LLM) — stages 1/2 use DiffusionModelRegistry via model_class_name
+    "HCXVisionV2ForCausalLM": (
+        "hcx_omni",
+        "hcx_omni",
+        "HCXOmniForConditionalGeneration",
+    ),
+    "HCXOmniForCausalLM": (
+        "hcx_omni",
+        "hcx_omni",
+        "HCXOmniForConditionalGeneration",
     ),
 }
 

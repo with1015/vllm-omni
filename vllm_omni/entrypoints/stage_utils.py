@@ -12,12 +12,21 @@ from omegaconf import OmegaConf
 logger = logging.getLogger(__name__)
 
 
-class OmniStageTaskType(enum.Enum):
-    GENERATE = "generate"
-    ABORT = "abort"
-    SHUTDOWN = "shutdown"
-    PROFILER_START = "profiler_start"
-    PROFILER_STOP = "profiler_stop"
+def set_stage_devices(
+    stage_id: int,
+    devices: str | int | None,
+    device_type: str | None = None,
+) -> str | None:
+    """Configure per-stage device visibility and current device (CUDA or NPU).
+
+    This function sets environment variables that control which devices are visible
+    to the process. It must be called BEFORE worker initialization so that workers
+    see the correct devices.
+
+
+    NOTE: This will set the control variable for the appropriate platform.
+        - CUDA: CUDA_VISIBLE_DEVICES
+        - NPU: ASCEND_RT_VISIBLE_DEVICES
 
 
 SHUTDOWN_TASK = {"type": OmniStageTaskType.SHUTDOWN}

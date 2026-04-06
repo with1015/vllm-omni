@@ -10,14 +10,23 @@ enabling concurrent request handling and streaming generation.
 
 import asyncio
 import uuid
+import weakref
 from collections.abc import AsyncGenerator, Iterable
 from concurrent.futures import ThreadPoolExecutor
 from typing import Any
 
 from vllm.logger import init_logger
 from vllm.transformers_utils.config import get_hf_file_to_dict
+try:
+    from huggingface_hub.errors import HFValidationError as _HFValidationError
+except ImportError:
+    _HFValidationError = ValueError
 
-from vllm_omni.diffusion.data import OmniDiffusionConfig, TransformerConfig
+from vllm_omni.diffusion.data import (
+    DiffusionRequestAbortedError,
+    OmniDiffusionConfig,
+    TransformerConfig,
+)
 from vllm_omni.diffusion.diffusion_engine import DiffusionEngine
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 from vllm_omni.inputs.data import OmniDiffusionSamplingParams, OmniPromptType
@@ -25,6 +34,18 @@ from vllm_omni.lora.request import LoRARequest
 from vllm_omni.outputs import OmniRequestOutput
 
 logger = init_logger(__name__)
+
+
+def _weak_close_async_omni_diffusion(engine: DiffusionEngine, executor: ThreadPoolExecutor) -> None:
+    """Best-effort diffusion cleanup for GC finalization."""
+    try:
+        engine.close()
+    except Exception:
+        pass
+    try:
+        executor.shutdown(wait=False)
+    except Exception:
+        pass
 
 
 class AsyncOmniDiffusion:
@@ -53,6 +74,7 @@ class AsyncOmniDiffusion:
         self,
         model: str,
         od_config: OmniDiffusionConfig | None = None,
+        batch_size: int = 1,
         **kwargs: Any,
     ):
         self.model = model
@@ -126,8 +148,14 @@ class AsyncOmniDiffusion:
         # Thread pool for running sync engine in async context
         self._executor = ThreadPoolExecutor(max_workers=1)
         self._closed = False
+        self._weak_finalizer = weakref.finalize(
+            self,
+            _weak_close_async_omni_diffusion,
+            self.engine,
+            self._executor,
+        )
 
-        logger.info("AsyncOmniDiffusion initialized with model: %s", model)
+        logger.info("AsyncOmniDiffusion initialized with model: %s, batch_size: %d", model, self._batch_size)
 
     async def generate(
         self,
@@ -136,7 +164,11 @@ class AsyncOmniDiffusion:
         request_id: str | None = None,
         lora_request: LoRARequest | None = None,
     ) -> OmniRequestOutput:
-        """Generate images asynchronously from a text prompt.
+        """Generate images asynchronously from a single text prompt.
+
+        For batched generation (multiple prompts in one engine call), use
+        :meth:`generate_batch` instead.  This method always processes
+        exactly one prompt per call.
 
         Args:
             prompt: Text prompt describing the desired image
@@ -175,7 +207,6 @@ class AsyncOmniDiffusion:
 
         logger.debug("Starting generation for request %s", request_id)
 
-        # Run engine in thread pool
         loop = asyncio.get_event_loop()
         try:
             # In async mode, only a single request is submitted at a time
@@ -226,6 +257,10 @@ class AsyncOmniDiffusion:
             return
         self._closed = True
 
+        finalizer = getattr(self, "_weak_finalizer", None)
+        if finalizer is not None and finalizer.alive:
+            finalizer.detach()
+
         try:
             self.engine.close()
         except Exception as e:
@@ -241,13 +276,6 @@ class AsyncOmniDiffusion:
     def shutdown(self) -> None:
         """Alias for close() method."""
         self.close()
-
-    def __del__(self) -> None:
-        """Best-effort cleanup on deletion."""
-        try:
-            self.close()
-        except Exception:
-            pass
 
     async def abort(self, request_id: str | Iterable[str]) -> None:
         """Abort a request."""

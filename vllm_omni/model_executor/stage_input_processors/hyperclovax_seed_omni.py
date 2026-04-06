@@ -62,7 +62,6 @@ def thinker2vision_decoder(
             continue
         output = thinker_output.outputs[0]
         output_token_ids = list(output.token_ids)
-
         vision_codes = _extract_discrete_tokens(
             output_token_ids, DISCRETE_IMAGE_UNIT_0_ID, DISCRETE_IMAGE_VOCAB_SIZE
         )

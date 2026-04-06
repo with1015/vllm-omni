@@ -133,6 +133,10 @@ class AsyncOmniLLM(AsyncLLM):
         self._pause_cond = asyncio.Condition()
         self._paused = False
 
+        # Set renderer for output handler compatibility with AsyncLLM
+        from vllm.renderers import renderer_from_config as _renderer_from_config
+        self.renderer = _renderer_from_config(self.vllm_config)
+
         # EngineCore (starts the engine in background process).
         self.engine_core = EngineCoreClient.make_async_mp_client(
             vllm_config=vllm_config,
