@@ -569,8 +569,41 @@ class HyperCLOVAXAudioDecoderModel(nn.Module):
 
         h = load_hparams_from_json(config_path)
 
-        # instantiate BigVGAN using h
-        model = cls(h)
+        # Instantiate model using hyperparameters from config.json.
+        # Constructor kwargs mirror the keys stored in h; unknown keys are ignored.
+        _INIT_KEYS = {
+            "resblock",
+            "causal",
+            "finetune",
+            "upsample_rates",
+            "upsample_kernel_sizes",
+            "upsample_initial_channel",
+            "resblock_kernel_sizes",
+            "resblock_dilation_sizes",
+            "use_tanh_at_final",
+            "use_bias_at_final",
+            "activation",
+            "snake_logscale",
+            "num_units",
+            "unit_emb_dim",
+            "num_mels",
+            "n_fft",
+            "hop_size",
+            "win_size",
+            "spk_emb_dim",
+            "spk_hidden_dim",
+            "global_context_att",
+            "sampling_rate",
+            "fmin",
+            "fmax",
+            "num_spk",
+            "pad_multiple",
+            "pad_token_id",
+        }
+        from vllm_omni.diffusion.data import OmniDiffusionConfig
+
+        od_config = OmniDiffusionConfig(model=str(ckpt_path))
+        model = cls(od_config=od_config, **{k: v for k, v in h.items() if k in _INIT_KEYS})
 
         # Load pretrained generator weight
         logger.info("Loading weights from local directory")

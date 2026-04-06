@@ -222,6 +222,8 @@ class HyperCLOVAXAudioPipeline(nn.Module):
             return unit, 1.0
 
         overflow = unit.shape[1] % pad_multiple
+        if overflow == 0:
+            return unit, 1.0
         pad_amount = pad_multiple - overflow
         padded = torch.nn.functional.pad(unit, (0, pad_amount), mode="constant", value=pad_token_id)
         return padded, unit.shape[-1] / padded.shape[-1]
