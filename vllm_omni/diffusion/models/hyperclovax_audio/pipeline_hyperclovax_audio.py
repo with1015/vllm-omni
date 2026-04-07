@@ -3,9 +3,13 @@
 
 import base64
 import io
+import json
 import math
 import os
+import tempfile
+import zipfile
 from collections.abc import Iterable
+from pathlib import Path
 from typing import Any
 
 import librosa
@@ -20,8 +24,6 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
-from vllm_omni.diffusion.distributed.utils import get_local_device
-from vllm_omni.diffusion.model_loader.diffusers_loader import DiffusersPipelineLoader
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .constants import AUDIO_FORMAT_MAP, DEFAULT_FORMAT, FORMAT_MIME_MAP, SPEAKERS_LIST, VOLUME_LEVEL
@@ -75,19 +77,66 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         self._dtype = od_config.dtype
 
         self.model = self.od_config.model
-        self.weights_sources = [
-            DiffusersPipelineLoader.ComponentSource(
-                model_or_path=od_config.model, subfolder="bigvgan", revision=None, prefix=None, fall_back_to_pt=True
-            )
-        ]
+        self.weights_sources = []
 
-        self.bigvgan = HyperCLOVAXAudioDecoderModel(od_config=od_config).to(self.device)
+        # Note:
+        #   Audio decoder checkpoint of HyperCLOVAX-Omni is currently provided as .mar format
+        mar_path = self._resolve_mar_path(self.model)
+        if mar_path is not None:
+            self._using_mar_checkpoint = True
+            self.weights_sources = []
+            ckpt_path, config_path = self._extract_mar_checkpoint(mar_path)
+            self.bigvgan = HyperCLOVAXAudioDecoderModel.from_pretrained(
+                ckpt_path=ckpt_path,
+                config_path=config_path,
+                map_location="cpu",
+            ).to(self.device)
+        else:
+            self.bigvgan = HyperCLOVAXAudioDecoderModel(
+                od_config=od_config).to(self.device)
 
         self.spk_emb = self.bigvgan.spk_emb.to(self.device)
         self._vocab = int(getattr(self.bigvgan.h, "num_units", 0))
 
         speakers = SPEAKERS_LIST
         self.speaker_map = {spk: i for i, spk in enumerate(speakers)}
+
+    def _resolve_mar_path(self, model: str | None) -> Path | None:
+        if model is None:
+            return None
+
+        model_path = Path(model)
+        if model_path.is_file() and model_path.suffix == ".mar":
+            return model_path
+
+        if not model_path.is_dir():
+            return None
+
+        candidates = [
+            model_path / "NCCosybigvganDecoder.mar",
+            model_path / "NCZSCosybigvganDecoder.mar",
+            model_path / "decoder" / "audio" / "NCCosybigvganDecoder.mar",
+            model_path / "decoder" / "audio" / "NCZSCosybigvganDecoder.mar",
+        ]
+        for candidate in candidates:
+            if candidate.exists():
+                return candidate
+        return None
+
+    def _extract_mar_checkpoint(self, mar_path: Path) -> tuple[str, str]:
+        extract_dir = Path(tempfile.mkdtemp(prefix="hcx_audio_decoder_"))
+        self._mar_extract_dir = str(extract_dir)
+
+        with zipfile.ZipFile(mar_path) as zf:
+            manifest = json.loads(zf.read("MAR-INF/MANIFEST.json"))
+            serialized_file = manifest.get("model", {}).get("serializedFile")
+            if not serialized_file:
+                raise ValueError(f"serializedFile not found in {mar_path}")
+
+            zf.extract(serialized_file, path=extract_dir)
+            zf.extract("config.json", path=extract_dir)
+
+        return str(extract_dir / serialized_file), str(extract_dir / "config.json")
 
     def _prepare_batch(
         self, audio_tokens: list[list[int]], speakers: list[str], formats: list[str], ref_audio_tokens: list[str]
@@ -140,8 +189,8 @@ class HyperCLOVAXAudioPipeline(nn.Module):
 
         Args:
             req: OmniDiffusionRequest must containing:
-                - extra["audio_tokens"]: List[List[int]]: [B, L] or [L, ] audio token ids.
-                - extra["speakers"]: List[str]: speaker for each audio sample.
+                - audio_tokens: List[List[int]]: [B, L] or [L, ] audio token ids.
+                - speakers: List[str]: speaker for each audio sample.
                 - extra["formats"]: List[str]: output audio format for each audio sample.
                 - extra["ref_audio_tokens"]: List[str]: base64 encoded reference audio for each audio sample.
 
@@ -150,13 +199,16 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         """
 
         # 1. Validate inputs exist in request
-        audio_tokens = req.extra.get("audio_tokens")
-        if audio_tokens is None:
-            return DiffusionOutput(output=None, error="audio_tokens required in req.extra")
+        request_input = req.prompts[0].get("additional_information", None)
+        if request_input is None:
+            return DiffusionOutput(
+                output=None, error="additional_information required in request_input")
 
-        speakers = req.extra.get("speakers")
-        if speakers is None:
-            return DiffusionOutput(output=None, error="speakers required in req.extra")
+        audio_tokens = request_input.get("audio_tokens")
+        if audio_tokens is None:
+            return DiffusionOutput(output=None, error="audio_tokens required in request_input")
+
+        speakers = request_input.get("speakers", ["fkms"]) * len(audio_tokens)
 
         if len(audio_tokens) != len(speakers):
             return DiffusionOutput(output=None, error="length of speakers and audio_tokens must be the same")
