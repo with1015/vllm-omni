@@ -24,6 +24,7 @@ from vllm.logger import init_logger
 from vllm.model_executor.models.utils import AutoWeightsLoader
 
 from vllm_omni.diffusion.data import DiffusionOutput, OmniDiffusionConfig
+from vllm_omni.diffusion.distributed.utils import get_local_device
 from vllm_omni.diffusion.request import OmniDiffusionRequest
 
 from .constants import AUDIO_FORMAT_MAP, DEFAULT_FORMAT, FORMAT_MIME_MAP, SPEAKERS_LIST, VOLUME_LEVEL
@@ -92,8 +93,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
                 map_location="cpu",
             ).to(self.device)
         else:
-            self.bigvgan = HyperCLOVAXAudioDecoderModel(
-                od_config=od_config).to(self.device)
+            self.bigvgan = HyperCLOVAXAudioDecoderModel(od_config=od_config).to(self.device)
 
         self.spk_emb = self.bigvgan.spk_emb.to(self.device)
         self._vocab = int(getattr(self.bigvgan.h, "num_units", 0))
@@ -201,8 +201,7 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         # 1. Validate inputs exist in request
         request_input = req.prompts[0].get("additional_information", None)
         if request_input is None:
-            return DiffusionOutput(
-                output=None, error="additional_information required in request_input")
+            return DiffusionOutput(output=None, error="additional_information required in request_input")
 
         audio_tokens = request_input.get("audio_tokens")
         if audio_tokens is None:
