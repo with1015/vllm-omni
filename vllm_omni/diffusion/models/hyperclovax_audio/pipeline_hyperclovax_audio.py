@@ -212,6 +212,9 @@ class HyperCLOVAXAudioPipeline(nn.Module):
         if len(audio_tokens) != len(speakers):
             return DiffusionOutput(output=None, error="length of speakers and audio_tokens must be the same")
 
+        if not all(speaker in SPEAKERS_LIST for speaker in speakers):
+            return DiffusionOutput(output=None, error=f"speakers must be one of {SPEAKERS_LIST}")
+
         # Optional: audio format. If not provided, use wav format as default.
         formats = req.extra.get("formats", [DEFAULT_FORMAT.lower()] * len(audio_tokens))
         if len(audio_tokens) != len(formats):
